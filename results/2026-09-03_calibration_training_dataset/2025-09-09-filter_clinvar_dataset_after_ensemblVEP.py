@@ -4,6 +4,9 @@ import os
 import re
 import numpy as np
 import matplotlib.pyplot as plt
+import requests
+
+#!{sys.executable} -m pip install requests
 
 #directories 
 mount_data = "/Users/jwillis/minerva/pejaverlab/data/2026-09-03_calibration_training_dataset"
@@ -109,34 +112,6 @@ def filter_AF_gnomad(missense_filtered_df):
     ].copy()
     
     return AF_filtered_df
-
-
-
-#5. restrict to only pathogenic/likely pathogenic and benign/likely benign variants to remove ALL VUSs, and those with conflicting classifications
-
-def filter_by_clinical_significance(af_filtered_df):
-    """
-    Filter the variant DataFrame to include only specific clinical significance categories.
-
-    Parameters:
-    - variant_df (pd.DataFrame): DataFrame containing variant data.
-
-    Returns:
-    - pd.DataFrame: Filtered DataFrame with only specified clinical significance categories.
-    """
-    print(af_filtered_df["CLIN_SIG"].value_counts())
-    
-    clin_sign_words_to_keep = [
-        "pathogenic",
-        "likely_pathogenic",
-        "pathogenic/likely_pathogenic",
-        "benign",
-        "likely_benign",
-        "benign/likely_benign"
-    ]
-    clin_sig_mask = af_filtered_df["CLIN_SIG"].isin(clin_sign_words_to_keep)
-    return af_filtered_df.loc[clin_sig_mask].copy()
-
 
 
 
@@ -248,10 +223,12 @@ vep_missense_hg37 = filter_missense_variants(canonical_transcripts_hg37)
 AF_filtered_hg38 = filter_AF_gnomad(vep_missense_hg38)  
 AF_filtered_hg37 = filter_AF_gnomad(vep_missense_hg37)  
 
-final_filtered_df_hg38 = filter_by_clinical_significance(AF_filtered_hg38)
-final_filtered_df_hg37 = filter_by_clinical_significance(AF_filtered_hg37)
+
+final_hg38 = AF_filtered_hg38.copy()
+final_hg37 = AF_filtered_hg37.copy()
 
 
+'''
 step_dataframes = {
 
             "vep_out_hg38_df": vep_out_hg38_df,
@@ -271,10 +248,112 @@ display(df_summary)
 
 plot_filter_summary(df_summary, metric="UniqueVariationID")
 plot_filter_summary(df_summary, metric="UniqueGeneSymbol")
+'''
+
+
+#remove mutpred2 training variants that overlap 
+
+
+def get_ensembl_entrez_ID(af_df) :
+
+    # Get unique Ensembl gene IDs
+    ensembl_genes = af_df["Gene"].dropna().unique()
+
+    print(len(ensembl_genes))
+    print(ensembl_genes[:10])
+    
+    return ensembl_genes
 
 
 
 
+def get_entrez_id_hg38(ensembl_gene):
+    url = f"https://rest.ensembl.org/xrefs/id/{ensembl_gene}"
+
+    r = requests.get(
+        url,
+        params={"external_db": "EntrezGene"},
+        headers={"Content-Type": "application/json"}
+    )
+
+    if r.status_code != 200:
+        return None
+
+    results = r.json()
+
+    if len(results) == 0:
+        return None
+
+    return results[0]["primary_id"]
+
+
+def get_entrez_id_hg37(ensembl_gene):
+    url = f"https://grch37.rest.ensembl.org/xrefs/id/{ensembl_gene}"
+
+    r = requests.get(
+        url,
+        params={"external_db": "EntrezGene"},
+        headers={"Content-Type": "application/json"}
+    )
+
+    if r.status_code != 200:
+        return None
+
+    results = r.json()
+
+    if not results:
+        return None
+
+    return results[0]["primary_id"]
+
+#usager: 
+
+ensembl_genes_hg38 = get_ensembl_entrez_ID(AF_filtered_hg38)
+ensembl_genes_hg37 = get_ensembl_entrez_ID(AF_filtered_hg37)
+
+entrez_map_hg38 = {}
+for gene1 in ensembl_genes_hg38:
+    entrez_map_hg38[gene1] = get_entrez_id_hg38(gene1)
+    
+final_hg38["Entrez_ID"] = final_hg38["Gene"].map(entrez_map_hg38)
+
+
+entrez_map_hg37 = {}
+for gene2 in ensembl_genes_hg37:
+    entrez_map_hg37[gene2] = get_entrez_id_hg37(gene2)
+
+final_hg37["Entrez_ID"] = final_hg37["Gene"].map(entrez_map_hg37)
+
+
+
+###protein to variant annotation
+
+# Keep missense variants only
+def convert_to_protein_variant_annot(final_df):
+    # Split S/N into reference and alternate amino acids
+    final_df[["Ref_AA", "Alt_AA"]] = final_df["Amino_acids"].str.split(
+        "/", expand=True
+    )
+
+    # Construct training-style protein variant: S21N
+    final_df["protein_variant"] = (
+        final_df["Ref_AA"]
+        + final_df["Protein_position"].astype(int).astype(str)
+        + final_df["Alt_AA"]
+    )
+
+    # Check result
+
+    final_df.head()
+    return final_df
+
+
+mutpred_to_merge_and_remove_hg38 = convert_to_protein_variant_annot(final_hg38)
+mutpred_to_merge_and_remove_hg37 = convert_to_protein_variant_annot(final_hg37)
+
+
+
+#REmove polyphen2 training variants also
 
 
 
