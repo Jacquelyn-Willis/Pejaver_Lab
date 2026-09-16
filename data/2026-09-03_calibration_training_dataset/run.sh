@@ -34,10 +34,25 @@ get_clinvar_test_data () {
 
 get_clinvar_test_data
 
-get_mp2_training_data () {
+get_mp2_training_data () { 
 
     #copy from local machine to HPC, Yile sent to me on slack 
     cp /Users/jwillis/Downloads/mp2_actual_training_data.txt "/Users/jwillis/minerva/pejaverlab/data/2026-09-03_calibration_training_dataset"
 
 }
-    
+
+
+get_polyphen2_training_data () {
+
+    cd $data || exit 1. #do this command or exit if it fails
+
+    wget -c https://genetics.bwh.harvard.edu/downloads/pph2/training/training-2.2.2.tar.gz
+
+
+}
+
+#fucnction calls 
+
+#get_mp2_training_data
+#get_clinvar_test_data
+get_polyphen2_training_data 

@@ -34,11 +34,14 @@ input_hg37 = pd.read_csv(os.path.join(mount_results, "clinvar_hg37_post_ensemble
 
 #METHOD1:
 ##1. pull down entrez_ID from ensembl
-##2. map them to mutpred entrez ID and AA change
+##2. map them to mutpred entrez ID and AA change/variant
+##3.filter out for variants found in mutpred2 training set
 
 #METHID2:
 ##1. pull down ensembl protein seq
-##2. map them to mutpred2 protein seq and AA change 
+##2. map them to mutpred2 protein seq and AA change/variant
+##3.filter out for variants found in mutpred2 training set
+
 
 ##POST ANALYSIS
 ##1. compare concordanance of methods 
@@ -126,13 +129,64 @@ hg_37_entrez_id_df = add_entrez_ids_hg37(input_hg37)
 hg_37_entrez_id_df.to_csv(os.path.join(mount_results, "vep_output_w_entrez_id_hg37.tsv"), sep="\t", index=False)
 
 
+##2.filter clinvar variants by mutpred2 training variants
+def pivot_long_mutpred2_training_variants():
+    train_df = pd.read_csv(
+        os.path.join(mount_data, 'mp2_actual_training_data.txt'),
+        sep="\t",
+        header=None,
+        low_memory=False
+    )
+
+    train_long = train_df[[1, 3, 4]].copy()
+
+    train_long = train_long.rename(
+        columns={
+            1: "training_variants",
+            3: "protein sequence",
+            4: "Entrez_ID"
+        }
+    )
+
+    # Split comma-separated variants into individual rows
+    train_long["protein_variant"] = (
+        train_long["training_variants"]
+        .fillna("")
+        .str.split(",")
+    )
+
+    train_long = train_long.explode("protein_variant")
+
+    # Clean up
+    train_long["protein_variant"] = (
+        train_long["protein_variant"]
+        .astype(str)
+        .str.strip()
+    )
+
+    # Normalize Entrez IDs
+    train_long["Entrez_ID"] = pd.to_numeric(
+        train_long["Entrez_ID"],
+        errors="coerce"
+    ).astype("Int64")
+
+    # Keep usable rows only
+    train_long = train_long[
+        train_long["Entrez_ID"].notna()
+        & train_long["protein_variant"].notna()
+        & (train_long["protein_variant"] != "")
+        & (train_long["protein_variant"] != "nan")
+    ].copy()
+
+    # Only keep the columns needed for matching
+    train_long = train_long[
+        ["Entrez_ID", "protein_variant", "protein sequence"]
+    ].drop_duplicates()
+
+    return train_long
 
 
-
-
-
-
-
+mutpred2_variants_df = pivot_long_mutpred2_training_variants()
 
 
 
@@ -215,7 +269,26 @@ def add_protein_sequences_hg37(final_df, id_column="Feature"):
 
 
 hg_38_protein_seq_id_df = add_protein_sequences_hg38(input_hg38)
+hg_38_protein_seq_id_df.to_csv(os.path.join(mount_results, "vep_output_w_protein_seq_hg38.tsv"), sep="\t", index=False)
+
+
 hg_37_protein_seq_id_df = add_protein_sequences_hg37(input_hg37)
+hg_37_protein_seq_id_df.to_csv(os.path.join(mount_results, "vep_output_w_protein_seq_hg37.tsv"), sep="\t", index=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 '''

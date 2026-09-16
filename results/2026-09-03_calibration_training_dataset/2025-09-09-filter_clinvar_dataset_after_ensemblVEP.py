@@ -5,7 +5,7 @@ import re
 import numpy as np
 import matplotlib.pyplot as plt
 import requests
-
+import tarfile
 #!{sys.executable} -m pip install requests
 
 #directories 
@@ -119,87 +119,7 @@ def filter_AF_gnomad(missense_filtered_df):
 
 ### PLOT and summary
 
-def build_filter_summary_table(step_dataframes, assembly_col="Assembly", assemblies=("GRCh37", "GRCh38")):
-    """
-    Build a summary table of unique GeneSymbol and unique VariationID counts
-    at each step of the filtering pipeline, separated by genome assembly.
-    """
-    rows = []
-    for step_label, step_df in step_dataframes.items():
-        if assembly_col in step_df.columns:
-            for asm in assemblies:
-                asm_df = step_df[step_df[assembly_col] == asm]
-                rows.append({
-                    "FilterStep": step_label,
-                    "Assembly": asm,
-                    "UniqueGeneSymbol": asm_df["Gene"].nunique(),
-                    "UniqueVariationID": asm_df["Uploaded_variation"].nunique(),
-                })
-        else:
-            # Fallback if a step DataFrame lacks an Assembly column
-            rows.append({
-                "FilterStep": step_label,
-                "Assembly": "All",
-                "UniqueGeneSymbol": step_df["Gene"].nunique(),
-                "UniqueVariationID": step_df["Uploaded_variation"].nunique(),
-            })
-    return pd.DataFrame(rows)
 
-
-def build_filter_summary_table(
-    step_dataframes,
-    assembly_col="Assembly",
-    assemblies=("GRCh37", "GRCh38")
-):
-    rows = []
-
-    for step_label, step_df in step_dataframes.items():
-        if assembly_col in step_df.columns:
-            for asm in assemblies:
-                asm_df = step_df[step_df[assembly_col] == asm]
-
-                rows.append({
-                    "FilterStep": step_label,
-                    "Assembly": asm,
-                    "UniqueGeneSymbol": asm_df["Gene"].nunique(),
-                    "UniqueVariationID": asm_df["Uploaded_variation"].nunique(),
-                })
-        else:
-            rows.append({
-                "FilterStep": step_label,
-                "Assembly": "All",
-                "UniqueGeneSymbol": step_df["Gene"].nunique(),
-                "UniqueVariationID": step_df["Uploaded_variation"].nunique(),
-            })
-
-    return pd.DataFrame(rows)
-
-def plot_filter_summary(df_summary, metric="UniqueVariationID"):
-    """
-    Plot a grouped bar chart comparing GRCh37 and GRCh38 counts per filter step
-    with exact numerical values labeled above each bar.
-    """
-    # Reshape data for plotting side-by-side assembly bars per step
-    pivot_df = df_summary.pivot(index="FilterStep", columns="Assembly", values=metric)
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    plot_order = pivot_df.index.tolist()
-    pivot_df.reindex(plot_order).plot(kind="bar", ax=ax, width=0.75)
-    
-    ax.set_title(f"Filtering Summary by Assembly ({metric})", fontsize=14, fontweight="bold", pad=15)
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_xlabel("Filter Step", fontsize=12)
-    plt.xticks(rotation=35, ha="right")
-    
-    # Annotate exact numbers above each bar
-    for container in ax.containers:
-        ax.bar_label(container, fmt="{:,.0f}", padding=3, fontsize=9)
-        
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    plt.tight_layout()
-    plt.show()
 
 
 
@@ -228,6 +148,56 @@ final_hg38 = AF_filtered_hg38.copy()
 final_hg37 = AF_filtered_hg37.copy()
 
 
+final_hg38.to_csv(
+        os.path.join(mount_results, "clinvar_hg38_post_ensemble_vep_filters_no_uniprot.tsv"),
+        sep="\t",
+        index=False
+    )
+
+final_hg37.to_csv(
+        os.path.join(mount_results, "clinvar_hg37_post_ensemble_vep_filters_no_uniprot.tsv"),
+        sep="\t",
+        index=False
+    )
+
+
+
+final_hg38.to_csv(
+        os.path.join(mount_results, "clinvar_hg38_post_ensemble_vep_filters_w_uniprot.tsv"),
+        sep="\t",
+        index=False
+    )
+
+final_hg37.to_csv(
+        os.path.join(mount_results, "clinvar_hg37_post_ensemble_vep_filters_w_uniprot.tsv"),
+        sep="\t",
+        index=False
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 '''
 step_dataframes = {
 
@@ -254,7 +224,7 @@ plot_filter_summary(df_summary, metric="UniqueGeneSymbol")
 #remove mutpred2 training variants that overlap 
 
 
-def get_ensembl_entrez_ID(af_df) :
+def get_ensembl_gene(af_df) :
 
     # Get unique Ensembl gene IDs
     ensembl_genes = af_df["Gene"].dropna().unique()
@@ -308,8 +278,8 @@ def get_entrez_id_hg37(ensembl_gene):
 
 #usager: 
 
-ensembl_genes_hg38 = get_ensembl_entrez_ID(AF_filtered_hg38)
-ensembl_genes_hg37 = get_ensembl_entrez_ID(AF_filtered_hg37)
+ensembl_genes_hg38 = get_ensembl_gene(AF_filtered_hg38)
+ensembl_genes_hg37 = get_ensembl_gene(AF_filtered_hg37)
 
 entrez_map_hg38 = {}
 for gene1 in ensembl_genes_hg38:
@@ -323,6 +293,240 @@ for gene2 in ensembl_genes_hg37:
     entrez_map_hg37[gene2] = get_entrez_id_hg37(gene2)
 
 final_hg37["Entrez_ID"] = final_hg37["Gene"].map(entrez_map_hg37)
+
+
+
+
+
+# ============================================================
+# 1. CREATE PROTEIN VARIANT ANNOTATION
+# ============================================================
+
+def convert_to_protein_variant_annot(df):
+    df = df.copy()
+
+    # Split S/N -> S and N
+    df[["Ref_AA", "Alt_AA"]] = df["Amino_acids"].str.split(
+        "/",
+        expand=True
+    )
+
+    # Make sure position is numeric
+    df["Protein_position"] = pd.to_numeric(
+        df["Protein_position"],
+        errors="coerce"
+    )
+
+    # Create S21N, G141S, R164P, etc.
+    valid = (
+        df["Ref_AA"].notna()
+        & df["Alt_AA"].notna()
+        & df["Protein_position"].notna()
+    )
+
+    df["protein_variant"] = pd.NA
+
+    df.loc[valid, "protein_variant"] = (
+        df.loc[valid, "Ref_AA"]
+        + df.loc[valid, "Protein_position"]
+            .astype(int)
+            .astype(str)
+        + df.loc[valid, "Alt_AA"]
+    )
+
+    return df
+
+
+mutpred_to_merge_and_remove_hg38 = (
+    convert_to_protein_variant_annot(final_hg38)
+)
+
+mutpred_to_merge_and_remove_hg37 = (
+    convert_to_protein_variant_annot(final_hg37)
+)
+
+
+
+
+# ============================================================
+# 2. PREPARE MUTPRED2 TRAINING VARIANTS
+# ============================================================
+
+train_df = pd.read_csv(os.path.join(mount_data,'mp2_actual_training_data.txt'),
+                sep="\t",
+                header=None,
+                low_memory=False,
+                names=["dataset ID", "protein variants", "training labels", "protein sequence", "Entrez ID", "unknown" ],
+            )
+
+train_long = train_df[[1, 4]].copy()
+
+train_long = train_long.rename(
+    columns={
+        1: "training_variants",
+        4: "Entrez_ID"
+    }
+)
+
+# Split comma-separated variants into individual rows
+train_long["protein_variant"] = (
+    train_long["training_variants"]
+    .fillna("")
+    .str.split(",")
+)
+
+train_long = train_long.explode("protein_variant")
+
+# Clean up
+train_long["protein_variant"] = (
+    train_long["protein_variant"]
+    .astype(str)
+    .str.strip()
+)
+
+# Normalize Entrez IDs
+train_long["Entrez_ID"] = pd.to_numeric(
+    train_long["Entrez_ID"],
+    errors="coerce"
+).astype("Int64")
+
+# Keep usable rows only
+train_long = train_long[
+    train_long["Entrez_ID"].notna()
+    & train_long["protein_variant"].notna()
+    & (train_long["protein_variant"] != "")
+    & (train_long["protein_variant"] != "nan")
+].copy()
+
+# Only keep the columns needed for matching
+train_long = train_long[
+    ["Entrez_ID", "protein_variant"]
+].drop_duplicates()
+
+
+# %%
+# ============================================================
+# 3. REMOVE MUTPRED2 TRAINING OVERLAPS
+# ============================================================
+
+def remove_mutpred2_training_variants(df, train_long):
+
+    df = df.copy()
+
+    # Normalize Entrez ID
+    df["Entrez_ID"] = pd.to_numeric(
+        df["Entrez_ID"],
+        errors="coerce"
+    ).astype("Int64")
+
+    merged = df.merge(
+        train_long,
+        on=["Entrez_ID", "protein_variant"],
+        how="left",
+        indicator=True
+    )
+
+    # Keep only variants NOT found in MutPred2 training data
+    filtered_df = (
+        merged[merged["_merge"] == "left_only"]
+        .drop(columns=["_merge"])
+        .copy()
+    )
+
+    return merged, filtered_df
+
+
+
+# ============================================================
+# 4. RUN HG38 / HG37
+# ============================================================
+
+mutpred_merge_removal_hg38, filtered_hg38 = (
+    remove_mutpred2_training_variants(
+        mutpred_to_merge_and_remove_hg38,
+        train_long
+    )
+)
+
+mutpred_merge_removal_hg37, filtered_hg37 = (
+    remove_mutpred2_training_variants(
+        mutpred_to_merge_and_remove_hg37,
+        train_long
+    )
+)
+
+
+#summary
+def removal_summary(start_df, merged_df, filtered_df, label):
+    
+    # Rows that were removed because they matched MutPred2
+    removed_df = merged_df[
+        merged_df["_merge"] == "both"
+    ].copy()
+
+    print(f"\n{label}")
+    print("=" * len(label))
+
+    print(
+        "Starting unique genes:",
+        start_df["Gene"].nunique()
+    )
+
+    print(
+        "Starting unique uploaded variations:",
+        start_df["Uploaded_variation"].nunique()
+    )
+
+    print(
+        "Removed unique genes:",
+        removed_df["Gene"].nunique()
+    )
+
+    print(
+        "Removed unique uploaded variations:",
+        removed_df["Uploaded_variation"].nunique()
+    )
+
+    print(
+        "Final unique genes:",
+        filtered_df["Gene"].nunique()
+    )
+
+    print(
+        "Final unique uploaded variations:",
+        filtered_df["Uploaded_variation"].nunique()
+    )
+
+
+removal_summary(
+    mutpred_to_merge_and_remove_hg38,
+    mutpred_merge_removal_hg38,
+    filtered_hg38,
+    "HG38"
+)
+
+removal_summary(
+    mutpred_to_merge_and_remove_hg37,
+    mutpred_merge_removal_hg37,
+    filtered_hg37,
+    "HG37"
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -351,13 +555,311 @@ def convert_to_protein_variant_annot(final_df):
 mutpred_to_merge_and_remove_hg38 = convert_to_protein_variant_annot(final_hg38)
 mutpred_to_merge_and_remove_hg37 = convert_to_protein_variant_annot(final_hg37)
 
+def remove_mutpred2_training_variants(df) : #mutpred to merge and remove df
 
+    
+    train_df = pd.read_csv(os.path.join(mount_data,'mp2_actual_training_data.txt'),
+                sep="\t",
+                header=None,
+                low_memory=False,
+                names=["dataset ID", "protein variants", "training labels", "protein sequence", "Entrez ID", "unknown" ],
+            )
+    
+    train_long = train_df[["protein variants", "Entrez ID"]].copy()
+
+
+
+         # Make merge columns the same dtype
+    df["Protein_position"] = pd.to_numeric(
+            df["Protein_position"],
+            errors="coerce"
+        )
+    
+    train_long["position"] = pd.to_numeric(
+            train_long["position"],
+            errors="coerce"
+        )
+    
+    df["Entrez_ID"] = pd.to_numeric(
+            df["Entrez_ID"],
+            errors="coerce"
+        ).astype("Int64")
+    
+    train_long["Entrez ID"] = pd.to_numeric(
+            train_long["Entrez ID"],
+            errors="coerce"
+        ).astype("Int64")
+        
+        
+    train_long = train_long.assign(
+        protein_variant=train_long["protein variants"].str.split(",")
+    ).explode("protein_variant")
+
+    train_long[["ref_aa", "position", "alt_aa"]] = train_long[
+        "protein_variant"
+    ].str.extract(r"^([A-Z])(\d+)([A-Z])$")
+
+    train_long["position"] = pd.to_numeric(
+        train_long["position"],
+        errors="coerce")
+    
+    print(train_long.head())
+    
+    merged = df.merge(
+    train_long,
+    left_on=["Entrez_ID", "Protein_position", "Ref_AA", "Alt_AA", "protein_variant"],
+    right_on=["Entrez ID", "position", "ref_aa", "alt_aa", "protein_variant"],
+    how="left",
+    indicator=True,
+)
+    filtered_df = merged[
+    merged["_merge"] == "left_only"].drop(
+        columns=["_merge", "position", "ref_aa", "alt_aa"]
+    )
+    
+    return  merged, filtered_df
+
+
+mutpred_merge_removal_hg38, df1 = remove_mutpred2_training_variants(mutpred_to_merge_and_remove_hg38)
+mutpred_merge_removal_hg37, df2 = remove_mutpred2_training_variants(mutpred_to_merge_and_remove_hg37)
+ 
+
+
+    
 
 #REmove polyphen2 training variants also
 
 
 
+def load_poly_phen_data ():
+    
+     
+    tar_path = os.path.join(
+        mount_data,
+        "training-2.2.2.tar.gz"
+    )
 
+    polyphen_files = [
+        "humdiv-2011_12.deleterious.pph.input",
+        "humdiv-2011_12.neutral.pph.input",
+        "humvar-2011_12.deleterious.pph.input",
+        "humvar-2011_12.neutral.pph.input",
+    ]
+
+    polyphen_dfs = []
+
+    with tarfile.open(tar_path, "r:gz") as tar:
+
+        for filename in polyphen_files:
+
+            member = tar.getmember(filename)
+
+            with tar.extractfile(member) as f:
+
+                df = pd.read_csv(
+                    f,
+                    sep="\t",
+                    header=None,
+                    names=[
+                        "uniprot_id",
+                        "position",
+                        "ref_aa",
+                        "alt_aa"
+                    ]
+                )
+
+                polyphen_dfs.append(df)
+
+    # Combine all four files
+    polyphen_train = pd.concat(
+        polyphen_dfs,
+        ignore_index=True
+    )
+
+    print(polyphen_train.head())
+    print(polyphen_train.shape)
+    
+    return polyphen_train
+
+poly_phen_training_set = load_poly_phen_data()
+
+
+
+
+
+def get_uniprot_ids_batch(transcripts, genome="hg38", batch_size=100):
+    
+    if genome == "hg38":
+        base_url = "https://rest.ensembl.org"
+    elif genome == "hg37":
+        base_url = "https://grch37.rest.ensembl.org"
+    else:
+        raise ValueError("genome must be 'hg38' or 'hg37'")
+
+    url = f"{base_url}/xrefs/id"
+
+    results_map = {}
+
+    for start in range(0, len(transcripts), batch_size):
+        batch = list(transcripts[start:start + batch_size])
+
+        response = requests.post(
+            url,
+            json={
+                "ids": batch
+            },
+            params={
+                "external_db": "UniProtKB/Swiss-Prot"
+            },
+            headers={
+                "Content-Type": "application/json"
+            },
+            timeout=60
+        )
+
+        response.raise_for_status()
+
+        results = response.json()
+
+        for transcript, refs in results.items():
+            if refs:
+                results_map[transcript] = refs[0]["primary_id"]
+            else:
+                results_map[transcript] = None
+
+    return results_map
+
+
+
+
+
+transcripts_hg38 = (
+    mutpred_merge_removal_hg38["Feature"]
+    .dropna()
+    .unique()
+)
+uniprot_map_hg38 = get_uniprot_ids_batch(
+    transcripts_hg38,
+    genome="hg38"
+)
+
+mutpred_merge_removal_hg38["UniProt_ID"] = (
+    mutpred_merge_removal_hg38["Feature"]
+    .map(uniprot_map_hg38)
+)
+
+print(
+    mutpred_merge_removal_hg38["UniProt_ID"].notna().sum(),
+    "of",
+    len(mutpred_merge_removal_hg38),
+    "rows have a UniProt ID"
+)
+
+
+
+
+
+
+
+transcripts_hg37 = (
+    mutpred_merge_removal_hg37["Feature"]
+    .dropna()
+    .unique()
+)
+
+uniprot_map_hg37 = {
+    transcript: get_uniprot_id(
+        transcript,
+        genome="hg37"
+    )
+    for transcript in transcripts_hg37
+}
+
+mutpred_merge_removal_hg37["UniProt_ID"] = (
+    mutpred_merge_removal_hg37["Feature"]
+    .map(uniprot_map_hg37)
+)
+
+
+
+def remove_polyphen_training_variants(vep_df):
+    # 1. Load your VEP dataset and the PolyPhen-2 training file
+
+    train_df = pd.read_csv(os.path.join(mount_data,'training-2.2.2.tar.gz'),
+            sep=r"\s+",
+            header= None,
+            names=["uniprot_id", "position", "ref_aa", "alt_aa"],
+            compression='gzip',
+            low_memory=False
+        )
+    # 2. Ensure gene symbols match (assuming you've mapped training uniprot_ids to gene SYMBOLS)
+    # train_df['SYMBOL'] = train_df['uniprot_id'].map(your_mapping_dict)
+
+    # 3. Perform the anti-join to drop training variants from your dataset
+    merged = vep_df.merge(
+        train_df,
+        left_on=["SYMBOL", "Protein_position", "Ref_AA", "Alt_AA"],
+        right_on=["SYMBOL", "position", "ref_aa", "alt_aa"],
+        how="left",
+        indicator=True,
+    )
+
+    filtered_df = merged[merged["_merge"] == "left_only"].drop(
+        columns=["_merge", "position", "ref_aa", "alt_aa"]
+    )
+    
+    return filtered_df
+    
+
+removed_polyphen_hg38 = remove_polyphen_training_variants(filtered_hg38)
+removed_polyphen_hg37 = remove_polyphen_training_variants(XX)
+
+
+#summarize and plot outputs:
+
+def build_filter_summary_table(step_dataframes):
+    rows = []
+
+    for step_label, step_df in step_dataframes.items():
+        
+            rows.append({
+                "FilterStep": step_label,
+                "Assembly": "All",
+                "UniqueGeneSymbol": step_df["Gene"].nunique(),
+                "UniqueVariationID": step_df["Uploaded_variation"].nunique(),
+            })
+
+    return pd.DataFrame(rows)
+
+
+
+
+def plot_filter_summary(df_summary, metric="UniqueVariationID"):
+    """
+    Plot a grouped bar chart comparing GRCh37 and GRCh38 counts per filter step
+    with exact numerical values labeled above each bar.
+    """
+    # Reshape data for plotting side-by-side assembly bars per step
+    pivot_df = df_summary.pivot(index="FilterStep", columns="Assembly", values=metric)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    plot_order = pivot_df.index.tolist()
+    pivot_df.reindex(plot_order).plot(kind="bar", ax=ax, width=0.75)
+    
+    ax.set_title(f"Filtering Summary by Assembly ({metric})", fontsize=14, fontweight="bold", pad=15)
+    ax.set_ylabel("Count", fontsize=12)
+    ax.set_xlabel("Filter Step", fontsize=12)
+    plt.xticks(rotation=35, ha="right")
+    
+    # Annotate exact numbers above each bar
+    for container in ax.containers:
+        ax.bar_label(container, fmt="{:,.0f}", padding=3, fontsize=9)
+        
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    plt.show()
 
 
 

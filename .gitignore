@@ -5,7 +5,9 @@
 *.txt
 *.tsv
 *.html
-
+*.input
+*.gz
+README
 
 # VEP output
 *.vep
