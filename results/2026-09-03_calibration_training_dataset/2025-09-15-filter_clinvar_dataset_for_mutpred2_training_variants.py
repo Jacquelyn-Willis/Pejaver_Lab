@@ -32,6 +32,9 @@ input_hg37 = pd.read_csv(os.path.join(mount_results, "clinvar_hg37_post_ensemble
         sep="\t", header = 0)
 
 
+
+
+
 #METHOD1:
 ##1. pull down entrez_ID from ensembl
 ##2. map them to mutpred entrez ID and AA change/variant
@@ -46,6 +49,11 @@ input_hg37 = pd.read_csv(os.path.join(mount_results, "clinvar_hg37_post_ensemble
 ##POST ANALYSIS
 ##1. compare concordanance of methods 
 #### which method allowed more accurate mapping ? 
+
+
+
+
+
 
 
 
@@ -118,18 +126,36 @@ def add_entrez_ids_hg37(final_df):
     final_df["Entrez_ID"] = final_df["Gene"].map(entrez_map_hg37)
     return final_df
 
-#usager: 
+
+#hg_38_entrez_id_df = add_entrez_ids_hg38(input_hg38)
+#hg_38_entrez_id_df.to_csv(os.path.join(mount_results, "vep_output_w_entrez_id_hg38.tsv"), sep="\t", index=False)
 
 
-hg_38_entrez_id_df = add_entrez_ids_hg38(input_hg38)
-hg_38_entrez_id_df.to_csv(os.path.join(mount_results, "vep_output_w_entrez_id_hg38.tsv"), sep="\t", index=False)
+#hg_37_entrez_id_df = add_entrez_ids_hg37(input_hg37)
+#hg_37_entrez_id_df.to_csv(os.path.join(mount_results, "vep_output_w_entrez_id_hg37.tsv"), sep="\t", index=False)
 
 
-hg_37_entrez_id_df = add_entrez_ids_hg37(input_hg37)
-hg_37_entrez_id_df.to_csv(os.path.join(mount_results, "vep_output_w_entrez_id_hg37.tsv"), sep="\t", index=False)
 
 
-##2.filter clinvar variants by mutpred2 training variants
+##2.reupload for usage
+
+hg_38_entrez_id_df = pd.read_csv(
+        os.path.join(mount_results, 'vep_output_w_entrez_id_hg38.tsv'),
+        sep="\t",
+        header=0,
+        low_memory=False
+    )
+
+hg_37_entrez_id_df = pd.read_csv(
+        os.path.join(mount_results, 'vep_output_w_entrez_id_hg37.tsv'),
+        sep="\t",
+        header=0,
+        low_memory=False
+    )
+
+
+
+##3.pivot long the variant column of the mutpred2 training variants 
 def pivot_long_mutpred2_training_variants():
     train_df = pd.read_csv(
         os.path.join(mount_data, 'mp2_actual_training_data.txt'),
@@ -189,6 +215,149 @@ def pivot_long_mutpred2_training_variants():
 mutpred2_variants_df = pivot_long_mutpred2_training_variants()
 
 
+##4. filter clinvar variant by the mutpred2 variants
+
+def filter_clinvar_by_entrez_variant(
+    clinvar_df,
+    mutpred2_variants_df,
+    gene_col="SYMBOL",
+    uploaded_variation_col="Uploaded_variation"
+):
+    """
+    Remove ClinVar variants overlapping MutPred2 training data
+    using Entrez_ID + protein_variant.
+
+    A protein_variant key is constructed in ClinVar from:
+        Amino_acids + Protein_position
+
+    Example:
+        Amino_acids = "A/V"
+        Protein_position = 209
+        -> protein_variant = "A209V"
+
+    Returns
+    -------
+    clinvar_filtered : pd.DataFrame
+        Filtered ClinVar dataframe.
+
+    summary : pd.DataFrame
+        Counts of unique genes and Uploaded_variation before and
+        after filtering.
+    """
+
+    clinvar = clinvar_df.copy()
+    mutpred2 = mutpred2_variants_df.copy()
+
+    # ---------------------------------------------------------
+    # Normalize Entrez IDs
+    # ---------------------------------------------------------
+    clinvar["Entrez_ID"] = pd.to_numeric(
+        clinvar["Entrez_ID"],
+        errors="coerce"
+    ).astype("Int64")
+
+    mutpred2["Entrez_ID"] = pd.to_numeric(
+        mutpred2["Entrez_ID"],
+        errors="coerce"
+    ).astype("Int64")
+
+    # ---------------------------------------------------------
+    # Construct protein_variant in ClinVar
+    # ---------------------------------------------------------
+    aa = clinvar["Amino_acids"].fillna("").str.split(
+        "/", expand=True
+    )
+
+    clinvar["protein_variant"] = (
+        aa[0].str.strip()
+        + clinvar["Protein_position"].astype("Int64").astype(str)
+        + aa[1].str.strip()
+    )
+
+    # Invalid/missing variants -> NA
+    invalid = (
+        (aa[0].str.strip() == "") |
+        (aa[1].str.strip() == "") |
+        clinvar["Protein_position"].isna()
+    )
+
+    clinvar.loc[invalid, "protein_variant"] = pd.NA
+
+    # ---------------------------------------------------------
+    # Starting counts
+    # ---------------------------------------------------------
+    start_gene_count = clinvar[gene_col].nunique(dropna=True)
+    start_variant_count = clinvar[uploaded_variation_col].nunique(
+        dropna=True
+    )
+    start_row_count = len(clinvar)
+
+    # ---------------------------------------------------------
+    # Build MutPred2 matching keys
+    # ---------------------------------------------------------
+    mutpred2_keys = (
+        mutpred2[
+            ["Entrez_ID", "protein_variant"]
+        ]
+        .dropna()
+        .drop_duplicates()
+    )
+
+    # ---------------------------------------------------------
+    # Match
+    # ---------------------------------------------------------
+    clinvar = clinvar.merge(
+        mutpred2_keys.assign(_mutpred2_match=True),
+        on=["Entrez_ID", "protein_variant"],
+        how="left"
+    )
+
+    # ---------------------------------------------------------
+    # Remove overlapping variants
+    # ---------------------------------------------------------
+    clinvar_filtered = clinvar[
+        clinvar["_mutpred2_match"].isna()
+    ].copy()
+
+    clinvar_filtered = clinvar_filtered.drop(
+        columns="_mutpred2_match"
+    )
+
+    # ---------------------------------------------------------
+    # Ending counts
+    # ---------------------------------------------------------
+    end_gene_count = clinvar_filtered[gene_col].nunique(
+        dropna=True
+    )
+    end_variant_count = clinvar_filtered[
+        uploaded_variation_col
+    ].nunique(dropna=True)
+    end_row_count = len(clinvar_filtered)
+
+    # ---------------------------------------------------------
+    # Summary
+    # ---------------------------------------------------------
+    summary = pd.DataFrame({
+        "metric": [
+            "Rows",
+            "Unique genes",
+            "Unique Uploaded_variation"
+        ],
+        "before_filter": [
+            start_row_count,
+            start_gene_count,
+            start_variant_count
+        ],
+        "after_filter": [
+            end_row_count,
+            end_gene_count,
+            end_variant_count
+        ]
+    })
+
+    return clinvar_filtered, summary
+
+
 
 
 
@@ -197,8 +366,6 @@ mutpred2_variants_df = pivot_long_mutpred2_training_variants()
 #Method2
 
 ##1. pull down ensembl protein seq for clinvar dataset
-
-
 
 def add_protein_sequences_hg38(final_df, id_column="Feature"):
     server = "https://rest.ensembl.org"
@@ -268,371 +435,682 @@ def add_protein_sequences_hg37(final_df, id_column="Feature"):
     return final_df
 
 
-hg_38_protein_seq_id_df = add_protein_sequences_hg38(input_hg38)
-hg_38_protein_seq_id_df.to_csv(os.path.join(mount_results, "vep_output_w_protein_seq_hg38.tsv"), sep="\t", index=False)
+#hg_38_protein_seq_id_df = add_protein_sequences_hg38(input_hg38)
+#hg_38_protein_seq_id_df.to_csv(os.path.join(mount_results, "vep_output_w_protein_seq_hg38.tsv"), sep="\t", index=False)
 
 
-hg_37_protein_seq_id_df = add_protein_sequences_hg37(input_hg37)
-hg_37_protein_seq_id_df.to_csv(os.path.join(mount_results, "vep_output_w_protein_seq_hg37.tsv"), sep="\t", index=False)
+#hg_37_protein_seq_id_df = add_protein_sequences_hg37(input_hg37)
+#hg_37_protein_seq_id_df.to_csv(os.path.join(mount_results, "vep_output_w_protein_seq_hg37.tsv"), sep="\t", index=False)
 
+##2.reupload dataframe for easy usage
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-'''
-# ============================================================
-# 1. CREATE PROTEIN VARIANT ANNOTATION
-# ============================================================
-
-def convert_to_protein_variant_annot(df):
-    df = df.copy()
-
-    # Split S/N -> S and N
-    df[["Ref_AA", "Alt_AA"]] = df["Amino_acids"].str.split(
-        "/",
-        expand=True
+hg_38_protein_seq_id_df = pd.read_csv(
+        os.path.join(mount_results, 'vep_output_w_protein_seq_hg38.tsv'),
+        sep="\t",
+        header=0,
+        low_memory=False
     )
 
-    # Make sure position is numeric
-    df["Protein_position"] = pd.to_numeric(
-        df["Protein_position"],
-        errors="coerce"
+hg_37_protein_seq_id_df = pd.read_csv(
+        os.path.join(mount_results, 'vep_output_w_protein_seq_hg37.tsv'),
+        sep="\t",
+        header=0,
+        low_memory=False
     )
 
-    # Create S21N, G141S, R164P, etc.
-    valid = (
-        df["Ref_AA"].notna()
-        & df["Alt_AA"].notna()
-        & df["Protein_position"].notna()
+
+
+#3. filter clinvar variants by protein seq and aa change 
+
+def filter_clinvar_by_sequence_variant(
+    clinvar_df,
+    mutpred2_variants_df,
+    clinvar_sequence_col="protein sequence",
+    mutpred2_sequence_col="protein sequence",
+    gene_col="SYMBOL",
+    uploaded_variation_col="Uploaded_variation"
+):
+    """
+    Remove ClinVar variants overlapping MutPred2 training data
+    using protein sequence + protein_variant.
+
+    Returns
+    -------
+    clinvar_filtered : pd.DataFrame
+        Filtered ClinVar dataframe.
+
+    summary : pd.DataFrame
+        Counts of unique genes and Uploaded_variation before and
+        after filtering.
+    """
+
+    clinvar = clinvar_df.copy()
+    mutpred2 = mutpred2_variants_df.copy()
+
+    # ---------------------------------------------------------
+    # Construct protein_variant in ClinVar
+    # ---------------------------------------------------------
+    aa = clinvar["Amino_acids"].fillna("").str.split(
+        "/", expand=True
     )
 
-    df["protein_variant"] = pd.NA
-
-    df.loc[valid, "protein_variant"] = (
-        df.loc[valid, "Ref_AA"]
-        + df.loc[valid, "Protein_position"]
-            .astype(int)
-            .astype(str)
-        + df.loc[valid, "Alt_AA"]
+    clinvar["protein_variant"] = (
+        aa[0].str.strip()
+        + clinvar["Protein_position"].astype("Int64").astype(str)
+        + aa[1].str.strip()
     )
 
-    return df
-
-
-mutpred_to_merge_and_remove_hg38 = convert_to_protein_variant_annot(final_hg38)
-
-
-mutpred_to_merge_and_remove_hg37 = (
-    convert_to_protein_variant_annot(final_hg37)
-)
-
-
-
-
-# ============================================================
-# 2. PREPARE MUTPRED2 TRAINING VARIANTS
-# ============================================================
-
-def prepare_mutpred2_training_variants():
-    
-    train_df = pd.read_csv(os.path.join(mount_data,'mp2_actual_training_data.txt'),
-                    sep="\t",
-                    header=None,
-                    low_memory=False,
-                    names=["dataset ID", "protein variants", "training labels", "protein sequence", "Entrez ID", "unknown" ],
-                )
-
-    train_long = train_df[[1, 4]].copy()
-
-    train_long = train_long.rename(
-        columns={
-            1: "training_variants",
-            4: "Entrez_ID"
-        }
+    invalid = (
+        (aa[0].str.strip() == "") |
+        (aa[1].str.strip() == "") |
+        clinvar["Protein_position"].isna()
     )
 
-    # Split comma-separated variants into individual rows
-    train_long["protein_variant"] = (
-        train_long["training_variants"]
-        .fillna("")
-        .str.split(",")
-    )
+    clinvar.loc[invalid, "protein_variant"] = pd.NA
 
-    train_long = train_long.explode("protein_variant")
-
-    # Clean up
-    train_long["protein_variant"] = (
-        train_long["protein_variant"]
-        .astype(str)
+    # ---------------------------------------------------------
+    # Normalize sequences
+    # ---------------------------------------------------------
+    clinvar[clinvar_sequence_col] = (
+        clinvar[clinvar_sequence_col]
+        .astype("string")
         .str.strip()
     )
 
-    # Normalize Entrez IDs
-    train_long["Entrez_ID"] = pd.to_numeric(
-        train_long["Entrez_ID"],
-        errors="coerce"
-    ).astype("Int64")
+    mutpred2[mutpred2_sequence_col] = (
+        mutpred2[mutpred2_sequence_col]
+        .astype("string")
+        .str.strip()
+    )
 
-    # Keep usable rows only
-    train_long = train_long[
-        train_long["Entrez_ID"].notna()
-        & train_long["protein_variant"].notna()
-        & (train_long["protein_variant"] != "")
-        & (train_long["protein_variant"] != "nan")
+    # ---------------------------------------------------------
+    # Starting counts
+    # ---------------------------------------------------------
+    start_gene_count = clinvar[gene_col].nunique(dropna=True)
+    start_variant_count = clinvar[uploaded_variation_col].nunique(
+        dropna=True
+    )
+    start_row_count = len(clinvar)
+
+    # ---------------------------------------------------------
+    # Build MutPred2 matching keys
+    # ---------------------------------------------------------
+    mutpred2_keys = (
+        mutpred2[
+            [mutpred2_sequence_col, "protein_variant"]
+        ]
+        .dropna()
+        .drop_duplicates()
+        .rename(
+            columns={
+                mutpred2_sequence_col: "_protein_sequence"
+            }
+        )
+    )
+
+    # Rename ClinVar sequence to common merge key
+    clinvar["_protein_sequence"] = clinvar[
+        clinvar_sequence_col
+    ]
+
+    # ---------------------------------------------------------
+    # Match on sequence + protein_variant
+    # ---------------------------------------------------------
+    clinvar = clinvar.merge(
+        mutpred2_keys.assign(_mutpred2_match=True),
+        on=["_protein_sequence", "protein_variant"],
+        how="left"
+    )
+
+    # ---------------------------------------------------------
+    # Remove overlapping variants
+    # ---------------------------------------------------------
+    clinvar_filtered = clinvar[
+        clinvar["_mutpred2_match"].isna()
     ].copy()
 
-    # Only keep the columns needed for matching
-    train_long = train_long[
-        ["Entrez_ID", "protein_variant"]
-    ].drop_duplicates()
-    
-    return train_long
-
-
-training_df_long = prepare_mutpred2_training_variants()
-
-# ============================================================
-# 3. REMOVE MUTPRED2 TRAINING OVERLAPS
-# ============================================================
-
-def remove_mutpred2_training_variants(df, train_long):
-
-    df = df.copy()
-
-    # Normalize Entrez ID
-    df["Entrez_ID"] = pd.to_numeric(
-        df["Entrez_ID"],
-        errors="coerce"
-    ).astype("Int64")
-
-    merged = df.merge(
-        train_long,
-        on=["Entrez_ID", "protein_variant"],
-        how="left",
-        indicator=True
+    # Remove helper columns
+    clinvar_filtered = clinvar_filtered.drop(
+        columns=[
+            "_mutpred2_match",
+            "_protein_sequence"
+        ]
     )
 
-    # Keep only variants NOT found in MutPred2 training data
-    filtered_df = (
-        merged[merged["_merge"] == "left_only"]
-        .drop(columns=["_merge"])
-        .copy()
+    # ---------------------------------------------------------
+    # Ending counts
+    # ---------------------------------------------------------
+    end_gene_count = clinvar_filtered[gene_col].nunique(
+        dropna=True
+    )
+    end_variant_count = clinvar_filtered[
+        uploaded_variation_col
+    ].nunique(dropna=True)
+    end_row_count = len(clinvar_filtered)
+
+    summary = pd.DataFrame({
+        "metric": [
+            "Rows",
+            "Unique genes",
+            "Unique Uploaded_variation"
+        ],
+        "before_filter": [
+            start_row_count,
+            start_gene_count,
+            start_variant_count
+        ],
+        "after_filter": [
+            end_row_count,
+            end_gene_count,
+            end_variant_count
+        ]
+    })
+
+    return clinvar_filtered, summary
+
+
+
+
+
+
+
+
+
+##COMPARE THE TWO METHODS
+
+def compare_filter_concordance(
+    clinvar_original,
+    clinvar_entrez_filtered,
+    clinvar_sequence_filtered,
+    uploaded_variation_col="Uploaded_variation",
+    gene_col="SYMBOL"
+):
+    """
+    Compare the variants removed by two filtering approaches.
+
+    The two filtering approaches are assumed to have started from
+    the same original ClinVar dataframe.
+
+    Returns
+    -------
+    concordance_summary : pd.DataFrame
+        Summary statistics comparing the two filters.
+
+    removed_by_entrez : pd.DataFrame
+        Variants removed only by Entrez_ID + protein_variant filter.
+
+    removed_by_sequence : pd.DataFrame
+        Variants removed only by sequence + protein_variant filter.
+
+    common_removed : pd.DataFrame
+        Variants removed by both filters.
+
+    details : dict
+        Sets containing the Uploaded_variation identifiers.
+    """
+
+    # ---------------------------------------------------------
+    # Sets of variants in each dataset
+    # ---------------------------------------------------------
+    original = set(
+        clinvar_original[uploaded_variation_col]
+        .dropna()
     )
 
-    return merged, filtered_df
-
-
-
-# ============================================================
-# 4. RUN HG38 / HG37
-# ============================================================
-
-mutpred_merge_removal_hg38, filtered_hg38 = (
-    remove_mutpred2_training_variants(
-        mutpred_to_merge_and_remove_hg38,
-        training_df_long
+    entrez_remaining = set(
+        clinvar_entrez_filtered[uploaded_variation_col]
+        .dropna()
     )
-)
 
-mutpred_merge_removal_hg37, filtered_hg37 = (
-    remove_mutpred2_training_variants(
-        mutpred_to_merge_and_remove_hg37,
-        training_df_long
+    sequence_remaining = set(
+        clinvar_sequence_filtered[uploaded_variation_col]
+        .dropna()
     )
-)
 
+    # ---------------------------------------------------------
+    # Variants removed by each filter
+    # ---------------------------------------------------------
+    removed_by_entrez_set = (
+        original - entrez_remaining
+    )
 
-#summary
-def removal_summary(start_df, merged_df, filtered_df, label):
-    
-    # Rows that were removed because they matched MutPred2
-    removed_df = merged_df[
-        merged_df["_merge"] == "both"
+    removed_by_sequence_set = (
+        original - sequence_remaining
+    )
+
+    common_removed_set = (
+        removed_by_entrez_set &
+        removed_by_sequence_set
+    )
+
+    entrez_only_set = (
+        removed_by_entrez_set -
+        removed_by_sequence_set
+    )
+
+    sequence_only_set = (
+        removed_by_sequence_set -
+        removed_by_entrez_set
+    )
+
+    # ---------------------------------------------------------
+    # Concordance statistics
+    # ---------------------------------------------------------
+    union_removed = (
+        removed_by_entrez_set |
+        removed_by_sequence_set
+    )
+
+    jaccard = (
+        len(common_removed_set) / len(union_removed)
+        if union_removed
+        else 1.0
+    )
+
+    entrez_shared_pct = (
+        len(common_removed_set) /
+        len(removed_by_entrez_set) * 100
+        if removed_by_entrez_set
+        else 0
+    )
+
+    sequence_shared_pct = (
+        len(common_removed_set) /
+        len(removed_by_sequence_set) * 100
+        if removed_by_sequence_set
+        else 0
+    )
+
+    # ---------------------------------------------------------
+    # Summary table
+    # ---------------------------------------------------------
+    concordance_summary = pd.DataFrame({
+        "metric": [
+            "Original Uploaded_variation",
+            "Removed by Entrez + protein_variant",
+            "Removed by sequence + protein_variant",
+            "Removed by both",
+            "Removed only by Entrez + protein_variant",
+            "Removed only by sequence + protein_variant",
+            "Union of variants removed",
+            "Jaccard concordance (%)",
+            "Entrez removals shared with sequence (%)",
+            "Sequence removals shared with Entrez (%)"
+        ],
+        "count": [
+            len(original),
+            len(removed_by_entrez_set),
+            len(removed_by_sequence_set),
+            len(common_removed_set),
+            len(entrez_only_set),
+            len(sequence_only_set),
+            len(union_removed),
+            jaccard * 100,
+            entrez_shared_pct,
+            sequence_shared_pct
+        ]
+    })
+
+    # ---------------------------------------------------------
+    # Pull actual rows for each category
+    # ---------------------------------------------------------
+    removed_by_entrez = clinvar_original[
+        clinvar_original[uploaded_variation_col].isin(
+            entrez_only_set
+        )
     ].copy()
 
-    print(f"\n{label}")
-    print("=" * len(label))
+    removed_by_sequence = clinvar_original[
+        clinvar_original[uploaded_variation_col].isin(
+            sequence_only_set
+        )
+    ].copy()
 
-    print(
-        "Starting unique genes:",
-        start_df["Gene"].nunique()
-    )
+    common_removed = clinvar_original[
+        clinvar_original[uploaded_variation_col].isin(
+            common_removed_set
+        )
+    ].copy()
 
-    print(
-        "Starting unique uploaded variations:",
-        start_df["Uploaded_variation"].nunique()
-    )
+    details = {
+        "removed_by_entrez": removed_by_entrez_set,
+        "removed_by_sequence": removed_by_sequence_set,
+        "common_removed": common_removed_set,
+        "entrez_only": entrez_only_set,
+        "sequence_only": sequence_only_set
+    }
 
-    print(
-        "Removed unique genes:",
-        removed_df["Gene"].nunique()
-    )
-
-    print(
-        "Removed unique uploaded variations:",
-        removed_df["Uploaded_variation"].nunique()
-    )
-
-    print(
-        "Final unique genes:",
-        filtered_df["Gene"].nunique()
-    )
-
-    print(
-        "Final unique uploaded variations:",
-        filtered_df["Uploaded_variation"].nunique()
+    return (
+        concordance_summary,
+        removed_by_entrez,
+        removed_by_sequence,
+        common_removed,
+        details
     )
 
 
-removal_summary(
-    mutpred_to_merge_and_remove_hg38,
-    mutpred_merge_removal_hg38,
-    filtered_hg38,
-    "HG38"
+
+
+
+
+# Filter 1
+clinvar_entrez_filtered_hg38, entrez_summary_hg38 = (
+    filter_clinvar_by_entrez_variant(
+        hg_38_entrez_id_df,
+        mutpred2_variants_df
+    )
 )
 
-removal_summary(
-    mutpred_to_merge_and_remove_hg37,
-    mutpred_merge_removal_hg37,
-    filtered_hg37,
-    "HG37"
+clinvar_entrez_filtered_hg38.to_csv(os.path.join(mount_results, "clinvar_mutpred2_entrez_filtered_hg38.tsv"), sep="\t", index=False)
+print(entrez_summary_hg38)    
+
+
+clinvar_entrez_filtered_hg37, entrez_summary_hg37 = (
+    filter_clinvar_by_entrez_variant(
+        hg_37_entrez_id_df,
+        mutpred2_variants_df
+    )
+)
+clinvar_entrez_filtered_hg37.to_csv(os.path.join(mount_results, "clinvar_mutpred2_entrez_filtered_hg37.tsv"), sep="\t", index=False)
+
+print(entrez_summary_hg37)    
+
+
+
+
+# Filter 2
+clinvar_sequence_filtered_hg38, sequence_summary_hg38 = (
+    filter_clinvar_by_sequence_variant(
+        hg_38_protein_seq_id_df,
+        mutpred2_variants_df,
+        clinvar_sequence_col="Protein_Sequence"
+    )
+)
+clinvar_sequence_filtered_hg38.to_csv(os.path.join(mount_results, "clinvar_mutpred2_prot_seq_filtered_hg38.tsv"), sep="\t", index=False)
+
+
+print(sequence_summary_hg38)
+
+
+clinvar_sequence_filtered_hg37, sequence_summary_hg37 = (
+    filter_clinvar_by_sequence_variant(
+        hg_37_protein_seq_id_df,
+        mutpred2_variants_df,
+        clinvar_sequence_col="Protein_Sequence"
+    )
+)
+clinvar_sequence_filtered_hg37.to_csv(os.path.join(mount_results, "clinvar_mutpred2_prot_seq_filtered_hg37.tsv"), sep="\t", index=False)
+
+print(sequence_summary_hg37)
+
+
+# Compare the two approaches
+(
+    concordance_summary_hg38,
+    removed_entrez_only_hg38,
+    removed_sequence_only_hg38,
+    removed_common_hg38,
+    concordance_details_hg38
+) = compare_filter_concordance(
+    clinvar_original=input_hg38,
+    clinvar_entrez_filtered=clinvar_entrez_filtered_hg38,
+    clinvar_sequence_filtered=clinvar_sequence_filtered_hg38
 )
 
+(
+    concordance_summary_hg37,
+    removed_entrez_only_hg37,
+    removed_sequence_only_hg37,
+    removed_common_hg37,
+    concordance_details_hg37
+) = compare_filter_concordance(
+    clinvar_original=input_hg37,
+    clinvar_entrez_filtered=clinvar_entrez_filtered_hg37,
+    clinvar_sequence_filtered=clinvar_sequence_filtered_hg37
+)
+
+print("ENTREZ FILTER")
+print(entrez_summary_hg38)
+
+print("\nSEQUENCE FILTER")
+print(sequence_summary_hg38)
+
+
+print("ENTREZ FILTER")
+print(entrez_summary_hg37)
+
+print("\nSEQUENCE FILTER")
+print(sequence_summary_hg37)
+
+print("\nCONCORDANCE")
+print(concordance_summary_hg38)
+
+print("\nCONCORDANCE")
+print(concordance_summary_hg37)
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-#summarize and plot outputs:
-
-def build_filter_summary_table(step_dataframes):
-    rows = []
-
-    for step_label, step_df in step_dataframes.items():
-        
-            rows.append({
-                "FilterStep": step_label,
-                "Assembly": "All",
-                "UniqueGeneSymbol": step_df["Gene"].nunique(),
-                "UniqueVariationID": step_df["Uploaded_variation"].nunique(),
-            })
-
-    return pd.DataFrame(rows)
-
-
-
-
-def plot_filter_summary(df_summary, metric="UniqueVariationID"):
+#plotting
+def plot_filter_summaries(
+    entrez_summary,
+    sequence_summary,
+    concordance_summary
+):
     """
-    Plot a grouped bar chart comparing GRCh37 and GRCh38 counts per filter step
-    with exact numerical values labeled above each bar.
-    """
-    # Reshape data for plotting side-by-side assembly bars per step
-    pivot_df = df_summary.pivot(index="FilterStep", columns="Assembly", values=metric)
+    Plot summary tables returned by the ClinVar/MutPred2 filtering functions.
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    plot_order = pivot_df.index.tolist()
-    pivot_df.reindex(plot_order).plot(kind="bar", ax=ax, width=0.75)
-    
-    ax.set_title(f"Filtering Summary by Assembly ({metric})", fontsize=14, fontweight="bold", pad=15)
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_xlabel("Filter Step", fontsize=12)
-    plt.xticks(rotation=35, ha="right")
-    
-    # Annotate exact numbers above each bar
-    for container in ax.containers:
-        ax.bar_label(container, fmt="{:,.0f}", padding=3, fontsize=9)
-        
+    Parameters
+    ----------
+    entrez_summary : pd.DataFrame
+        Summary returned by filter_clinvar_by_entrez_variant()
+
+    sequence_summary : pd.DataFrame
+        Summary returned by filter_clinvar_by_sequence_variant()
+
+    concordance_summary : pd.DataFrame
+        Summary returned by compare_filter_concordance()
+
+    Returns
+    -------
+    None
+        Displays three plots.
+    """
+
+    # ========================================================
+    # Plot 1: Before vs After filtering
+    # ========================================================
+
+    # Combine the two filtering summaries
+    metrics = entrez_summary["metric"].tolist()
+
+    before = entrez_summary["before_filter"].values
+    entrez_after = entrez_summary["after_filter"].values
+    sequence_after = sequence_summary["after_filter"].values
+
+    x = np.arange(len(metrics))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    bars1 = ax.bar(
+        x - width,
+        before,
+        width,
+        label="Before filter"
+    )
+
+    bars2 = ax.bar(
+        x,
+        entrez_after,
+        width,
+        label="Entrez ID + protein variant"
+    )
+
+    bars3 = ax.bar(
+        x + width,
+        sequence_after,
+        width,
+        label="Protein sequence + protein variant"
+    )
+
+    ax.set_ylabel("Count")
+    ax.set_title(
+        "ClinVar Variants Before and After MutPred2 Filtering"
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics)
+
+    ax.legend(frameon=False)
+
+    ax.bar_label(
+        bars1,
+        labels=[f"{int(v):,}" for v in before],
+        padding=3
+    )
+
+    ax.bar_label(
+        bars2,
+        labels=[f"{int(v):,}" for v in entrez_after],
+        padding=3
+    )
+
+    ax.bar_label(
+        bars3,
+        labels=[f"{int(v):,}" for v in sequence_after],
+        padding=3
+    )
+
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+
     plt.tight_layout()
     plt.show()
 
 
+    # ========================================================
+    # Plot 2: Concordance of variants removed
+    # ========================================================
+
+    # Pull values directly from concordance_summary
+    concordance_lookup = dict(
+        zip(
+            concordance_summary["metric"],
+            concordance_summary["count"]
+        )
+    )
+
+    labels = [
+        "Both filters",
+        "Entrez only",
+        "Sequence only"
+    ]
+
+    values = [
+        concordance_lookup[
+            "Removed by both"
+        ],
+
+        concordance_lookup[
+            "Removed only by Entrez + protein_variant"
+        ],
+
+        concordance_lookup[
+            "Removed only by sequence + protein_variant"
+        ]
+    ]
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    bars = ax.bar(
+        labels,
+        values
+    )
+
+    ax.set_ylabel("Unique Uploaded_variation")
+    ax.set_title(
+        "Concordance of Variants Removed"
+    )
+
+    ax.bar_label(
+        bars,
+        labels=[f"{int(v):,}" for v in values],
+        padding=4
+    )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+    plt.show()
 
 
+    # ========================================================
+    # Plot 3: Concordance percentages
+    # ========================================================
 
+    percentage_metrics = [
+        "Jaccard concordance (%)",
+        "Entrez removals shared with sequence (%)",
+        "Sequence removals shared with Entrez (%)"
+    ]
 
+    percentage_labels = [
+        "Jaccard",
+        "Entrez → Sequence",
+        "Sequence → Entrez"
+    ]
 
+    percentages = [
+        concordance_lookup[m]
+        for m in percentage_metrics
+    ]
 
-def main():
-  
-  
-    vep_out_hg38_df = read_vep_output(os.path.join(mount_results,
-    "clinvar_filtered_for_ensemblVEP_hg38_vep_output.txt"))
+    fig, ax = plt.subplots(figsize=(8, 6))
 
-    vep_out_hg37_df = read_vep_output(os.path.join(mount_results,
-    "clinvar_filtered_for_ensemblVEP_hg37_vep_output.txt"))
+    bars = ax.bar(
+        percentage_labels,
+        percentages
+    )
+
+    ax.set_ylabel("Concordance (%)")
+    ax.set_ylim(0, 105)
+    ax.set_title(
+        "Concordance Between Filtering Strategies"
+    )
+
+    ax.bar_label(
+        bars,
+        labels=[f"{v:.1f}%" for v in percentages],
+        padding=4
+    )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+    plt.show()
     
-    mane_select_transcripts_hg38 = filter_mane_select_transcripts(vep_out_hg38_df)
-    canonical_transcripts_hg37 = filter_canonical_transcripts(vep_out_hg37_df)
-
-    
-    vep_missense_hg38 = filter_missense_variants(mane_select_transcripts_hg38)
-    vep_missense_hg37 = filter_missense_variants(canonical_transcripts_hg37)
-
-    AF_filtered_hg38 = filter_AF_gnomad(vep_missense_hg38)  
-    AF_filtered_hg37 = filter_AF_gnomad(vep_missense_hg37)  
-    
-    # Return a dictionary of the DataFrames you want to inspect
-    return {
-        "vep_out_hg38_df": vep_out_hg38_df,
-        "vep_out_hg37_df": vep_out_hg37_df,
-        "MANE_Select_hg38": mane_select_transcripts_hg38,
-        "Canonical_hg37": canonical_transcripts_hg37,
-        "AF_hg38": AF_filtered_hg38,
-        "AF_hg37": AF_filtered_hg37,
-        "missense_hg38": vep_missense_hg38,
-        "missense_hg37": vep_missense_hg37
-    }
 
 
 
 
-# Execute main and capture outputs into global variables
-if __name__ == "__main__":
-    results = main()
-    
-    # Access and view any specific DataFrame
-    vep_out_38 = results["vep_out_hg38_df"]
-    vep_out_37 = results["vep_out_hg37_df"]
-    af_38_df = results["AF_hg38"]
-    af_37_df = results["AF_hg37"]
-    missense_38_df = results["missense_hg38"]
-    missense_37_df = results["missense_hg37"]
-    mane_select_38_df = results["MANE_Select_hg38"]
-    canonical_37_df = results["Canonical_hg37"] 
-    
-    
-    
 
 
-    
-    
-    
-    
-'''
+
+
+
+#function calls 
+
+
+plot_filter_summaries(
+    entrez_summary=entrez_summary_hg38,
+    sequence_summary=sequence_summary_hg38,
+    concordance_summary=concordance_summary_hg38
+)
+
+plot_filter_summaries(
+    entrez_summary=entrez_summary_hg37,
+    sequence_summary=sequence_summary_hg37,
+    concordance_summary=concordance_summary_hg37
+)

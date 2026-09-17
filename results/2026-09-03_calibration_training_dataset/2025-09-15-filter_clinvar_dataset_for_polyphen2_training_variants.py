@@ -25,11 +25,26 @@ pd.set_option('display.max_rows', None)
 
 #LOAD DATA
 
-input_hg38 = pd.read_csv(os.path.join(mount_results, "clinvar_hg38_post_ensemble_vep_filters_w_uniprot.tsv"),
-        sep="\t", header = 0)
+uniprot_hg38 = pd.read_csv(os.path.join(mount_results, "clinvar_hg38_post_ensemble_vep_filters_w_uniprot.tsv"),
+        sep="\t", header = 0, low_memory=False)
 
-input_hg37 = pd.read_csv(os.path.join(mount_results, "clinvar_hg37_post_ensemble_vep_filters_w_uniprot.tsv"),
-        sep="\t", header = 0)
+uniprot_hg37 = pd.read_csv(os.path.join(mount_results, "clinvar_hg37_post_ensemble_vep_filters_w_uniprot.tsv"),
+        sep="\t", header = 0, low_memory=False)
+
+
+mutpred2_entrezid_filtered_hg38 = pd.read_csv(os.path.join(mount_results, "clinvar_mutpred2_entrez_filtered_hg38.tsv"),
+        sep="\t", header = 0,low_memory=False)
+
+mutpred2_entrezid_filtered_hg37 = pd.read_csv(os.path.join(mount_results, "clinvar_mutpred2_entrez_filtered_hg37.tsv"),
+        sep="\t", header = 0, low_memory=False)
+
+
+mutpred2_prot_seq_filtered_hg38 = pd.read_csv(os.path.join(mount_results, "clinvar_mutpred2_prot_seq_filtered_hg38.tsv"),
+        sep="\t", header = 0, low_memory=False)
+
+
+mutpred2_prot_seq_filtered_hg37 = pd.read_csv(os.path.join(mount_results, "clinvar_mutpred2_prot_seq_filtered_hg37.tsv"),
+        sep="\t", header = 0, low_memory=False)
 
 
 #METHOD1:
@@ -46,7 +61,9 @@ input_hg37 = pd.read_csv(os.path.join(mount_results, "clinvar_hg37_post_ensemble
 
 
 
-#METHOD1: remove polyphen training variants that overlap 
+#METHOD1: remove polyphen training variants that overlap using uniprot ID from ensembl VEP output
+##***can only use method1 on hg38 because hg37 vep did not output the updated uniport annotation for hg37
+
 
 #1. upload polyphen training set data
 def load_poly_phen_data ():
@@ -98,194 +115,756 @@ def load_poly_phen_data ():
     
     return polyphen_train
 
-
 poly_phen_training_set = load_poly_phen_data()
 
 
-def remove_polyphen_variants(final_df, polyphen_train):
+#2. filter and remove polyphen2 training variants using uniprot id and AA change and post 
 
-    # Clean ClinVar's UniProt ID (SwissProt first, fallback to TREMBL)
-    def extract_uniprot_id(value):
-        if pd.isna(value) or value == '-':
-            return None
-        first = value.split(',')[0].split(';')[0].strip()
-        return first.split('.')[0]
+def filter_clinvar_by_uniprot_training(
+    clinvar_df,
+    training_df,
+    clinvar_uniprot_col="SWISSPROT_y",
+    gene_col="SYMBOL",
+    uploaded_variation_col="Uploaded_variation"
+):
+    """
+    Filter a ClinVar dataframe using a UniProt-based MutPred2
+    training dataframe.
 
-    final_df['UNIPROT_ID'] = final_df['SWISSPROT'].apply(extract_uniprot_id)
-    final_df['UNIPROT_ID'] = final_df['UNIPROT_ID'].fillna(
-        final_df['TREMBL'].apply(extract_uniprot_id)
+    Matching key:
+        normalized UniProt ID + position + ref_aa + alt_aa
+
+    Example ClinVar:
+        SWISSPROT_y      = P05161.238
+        Protein_position = 141
+        Amino_acids      = G/S
+
+    Example training:
+        uniprot_id = P05161
+        position   = 141
+        ref_aa     = G
+        alt_aa     = S
+
+    These are considered a match.
+
+    Returns
+    -------
+    clinvar_filtered : pd.DataFrame
+        Filtered ClinVar dataframe.
+
+    summary : pd.DataFrame
+        Before/after/removed counts.
+
+    removed_variants : pd.DataFrame
+        ClinVar rows removed because they matched the training set.
+    """
+
+    clinvar = clinvar_df.copy()
+    training = training_df.copy()
+
+    # =========================================================
+    # 1. Normalize UniProt IDs
+    # =========================================================
+
+    clinvar["_uniprot_id"] = (
+        clinvar[clinvar_uniprot_col]
+        .astype("string")
+        .str.strip()
+        .str.split(".")
+        .str[0]
     )
 
-    # Split Amino_acids column ("S/N") into WT/Mut
-    aa_split = final_df['Amino_acids'].str.split('/', expand=True)
-    final_df['WT_AA'] = aa_split[0]
-    final_df['Mut_AA'] = aa_split[1]
-
-    # Build matching key on ClinVar side
-    final_df['match_key'] = (
-        final_df['UNIPROT_ID'].astype(str) + "_" +
-        final_df['Protein_position'].astype(str) + "_" +
-        final_df['WT_AA'].astype(str) + "_" +
-        final_df['Mut_AA'].astype(str)
+    training["_uniprot_id"] = (
+        training["uniprot_id"]
+        .astype("string")
+        .str.strip()
+        .str.split(".")
+        .str[0]
     )
 
-    # Build matching key on PolyPhen training side
-    polyphen_train['match_key'] = (
-        polyphen_train['uniprot_id'].astype(str) + "_" +
-        polyphen_train['position'].astype(str) + "_" +
-        polyphen_train['ref_aa'].astype(str) + "_" +
-        polyphen_train['alt_aa'].astype(str)
+    # =========================================================
+    # 2. Normalize protein positions
+    # =========================================================
+
+    clinvar["_position"] = pd.to_numeric(
+        clinvar["Protein_position"],
+        errors="coerce"
+    ).astype("Int64")
+
+    training["_position"] = pd.to_numeric(
+        training["position"],
+        errors="coerce"
+    ).astype("Int64")
+
+    # =========================================================
+    # 3. Parse reference / alternate amino acids from ClinVar
+    # =========================================================
+
+    aa = (
+        clinvar["Amino_acids"]
+        .astype("string")
+        .str.split("/", n=1, expand=True)
     )
 
-    polyphen_keys = set(polyphen_train['match_key'])
+    clinvar["_ref_aa"] = aa[0].str.strip()
+    clinvar["_alt_aa"] = aa[1].str.strip()
 
-    print(f"gene count Before filtering: {final_df['Gene'].nunique()}")
-    print(f"variant count Before filtering: {final_df['Uploaded_variation'].nunique()}")
-    final_df_filtered = final_df[~final_df['match_key'].isin(polyphen_keys)].copy()
-    print(f"gene count After filtering: {final_df_filtered['Gene'].nunique()}")
-    print(f"variant count Before filtering: {final_df_filtered['Uploaded_variation'].nunique()}")
-    print(f"genes Removed: {final_df['Gene'].nunique() - final_df_filtered['Gene'].nunique()}")
-    print(f"variants Removed: {final_df['Uploaded_variation'].nunique() - final_df_filtered['Uploaded_variation'].nunique()}")
+    # =========================================================
+    # 4. Normalize training amino acids
+    # =========================================================
+
+    training["_ref_aa"] = (
+        training["ref_aa"]
+        .astype("string")
+        .str.strip()
+    )
+
+    training["_alt_aa"] = (
+        training["alt_aa"]
+        .astype("string")
+        .str.strip()
+    )
+
+    # =========================================================
+    # 5. Create explicit matching key
+    #
+    # Example:
+    # P05161:G141S
+    # =========================================================
+
+    clinvar["uniprot_variant_key"] = (
+        clinvar["_uniprot_id"]
+        + ":"
+        + clinvar["_ref_aa"]
+        + clinvar["_position"].astype("string")
+        + clinvar["_alt_aa"]
+    )
+
+    training["uniprot_variant_key"] = (
+        training["_uniprot_id"]
+        + ":"
+        + training["_ref_aa"]
+        + training["_position"].astype("string")
+        + training["_alt_aa"]
+    )
+
+    # =========================================================
+    # 6. Starting counts
+    # =========================================================
+
+    before_rows = len(clinvar)
+
+    before_genes = clinvar[
+        gene_col
+    ].nunique(dropna=True)
+
+    before_variants = clinvar[
+        uploaded_variation_col
+    ].nunique(dropna=True)
+
+    # =========================================================
+    # 7. Training-set keys
+    # =========================================================
+
+    training_keys = (
+        training[
+            ["uniprot_variant_key"]
+        ]
+        .dropna()
+        .drop_duplicates()
+        .assign(_training_match=True)
+    )
+
+    # =========================================================
+    # 8. Match ClinVar to training set
+    # =========================================================
+
+    clinvar = clinvar.merge(
+        training_keys,
+        on="uniprot_variant_key",
+        how="left"
+    )
+
+    # =========================================================
+    # 9. Identify variants being removed
+    # =========================================================
+
+    removed_variants = clinvar[
+        clinvar["_training_match"].eq(True)
+    ].copy()
+
+    # =========================================================
+    # 10. Filter
+    # =========================================================
+
+    clinvar_filtered = clinvar[
+        clinvar["_training_match"].isna()
+    ].copy()
+
+    # =========================================================
+    # 11. Ending counts
+    # =========================================================
+
+    after_rows = len(clinvar_filtered)
+
+    after_genes = clinvar_filtered[
+        gene_col
+    ].nunique(dropna=True)
+
+    after_variants = clinvar_filtered[
+        uploaded_variation_col
+    ].nunique(dropna=True)
+
+    # =========================================================
+    # 12. Summary
+    # =========================================================
+
+    summary = pd.DataFrame({
+        "metric": [
+            "Rows",
+            "Unique genes",
+            "Unique Uploaded_variation"
+        ],
+        "before_filter": [
+            before_rows,
+            before_genes,
+            before_variants
+        ],
+        "after_filter": [
+            after_rows,
+            after_genes,
+            after_variants
+        ],
+        "removed": [
+            before_rows - after_rows,
+            before_genes - after_genes,
+            before_variants - after_variants
+        ]
+    })
+
+    # =========================================================
+    # 13. Remove temporary columns
+    # =========================================================
+
+    helper_cols = [
+        "_uniprot_id",
+        "_position",
+        "_ref_aa",
+        "_alt_aa",
+        "_training_match"
+    ]
+
+    clinvar_filtered = clinvar_filtered.drop(
+        columns=helper_cols,
+        errors="ignore"
+    )
+
+    removed_variants = removed_variants.drop(
+        columns=helper_cols,
+        errors="ignore"
+    )
+
+    return (
+        clinvar_filtered,
+        summary,
+        removed_variants
+    )
+
+
+
+(
+    clinvar_uniprot_filtered_w_mutpred2_entrezid_filtered_hg38,
+    uniprot_summary_w_mutpred2_entrezid_filtered_hg38,
+    uniprot_removed_w_mutpred2_entrezid_filtered_hg38
+) = filter_clinvar_by_uniprot_training(
+    clinvar_df=mutpred2_entrezid_filtered_hg38,
+    training_df=poly_phen_training_set,
+    clinvar_uniprot_col="SWISSPROT"
+)
+
+print(uniprot_summary_w_mutpred2_entrezid_filtered_hg38)
+
+(
+    clinvar_uniprot_filtered_w_mutpred2_prot_seq_filtered_hg38,
+    uniprot_summary_w_mutpred2_prot_seq_filtered_hg38,
+    uniprot_removed_w_mutpred2_prot_seq_filtered_hg38
+) = filter_clinvar_by_uniprot_training(
+    clinvar_df=mutpred2_prot_seq_filtered_hg38,
+    training_df=poly_phen_training_set,
+    clinvar_uniprot_col="SWISSPROT"
+)
+
+print(uniprot_summary_w_mutpred2_prot_seq_filtered_hg38)
+
+
+
+def get_uniprot_ids_hg38(input_df, server="https://rest.ensembl.org"):
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json"})
+    
+    ensembl_genes = input_df["Gene"].dropna().unique()
+    results = {}
     
 
-    final_df_filtered = final_df_filtered.drop(columns=['match_key', 'WT_AA', 'Mut_AA'])
+    for i, gene_id in enumerate(ensembl_genes, 1):
+        url = f"{server}/xrefs/id/{gene_id}"
+        
+        try:
+            r = session.get(
+                url,
+                params={"external_db": "Uniprot/SWISSPROT"},
+                timeout=30
+            )
 
-    return final_df_filtered
+            if r.status_code == 200:
+                xrefs = r.json()
+                results[gene_id] = [
+                    x["primary_id"] for x in xrefs
+                    if "primary_id" in x
+                ]
+            else:
+                results[gene_id] = []
+
+        except requests.RequestException:
+            results[gene_id] = []
+
+        # small delay to avoid hammering the API
+        time.sleep(0.05)
+
+        if i % 100 == 0:
+            print(f"{i}/{len(ensembl_genes)} completed")
+
+    return results
+
+def add_uniprot_ids_hg38(final_df):
+    ensembl_genes = final_df["Gene"].dropna().unique()
+
+    print(len(ensembl_genes))
+    print(ensembl_genes[:10])
+
+    uniprot_map_hg38 = get_uniprot_ids_hg38(final_df)
+
+    final_df["UniProt_ID"] = final_df["Gene"].map(uniprot_map_hg38)
+
+    return final_df
 
 
-final_df_filtered_hg38 = remove_polyphen_variants(input_hg38, poly_phen_training_set)
-final_df_filtered_hg38.to_csv(os.path.join(mount_results, "clivar_filtered_for_polyphen_hg38_method1.tsv"), sep="\t", index=False)
-
-final_df_filtered_hg37 = remove_polyphen_variants(input_hg37, poly_phen_training_set)
-final_df_filtered_hg37.to_csv(os.path.join(mount_results, "clivar_filtered_for_polyphen_hg37_method1.tsv"), sep="\t", index=False)
+uniprot_map_entrezid_filtered_hg38 = add_uniprot_ids_hg38(mutpred2_entrezid_filtered_hg38)
+uniprot_map_entrezid_filtered_hg38.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg38.tsv"), sep="\t", index=False)
+#clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg38 = add_uniprot_ids_hg38(mutpred2_prot_seq_filtered_hg38)
 
 
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg38 = add_uniprot_ids_hg38(mutpred2_prot_seq_filtered_hg38)
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg38.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg38.tsv"), sep="\t", index=False)
+
+
+def get_uniprot_ids_hg37(input_df):
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json"})
+    
+    ensembl_genes = input_df["Gene"].dropna().unique()
+    results = {}
+    
+
+    for i, gene_id in enumerate(ensembl_genes, 1):
+        url = f"https://grch37.rest.ensembl.org/xrefs/id/{gene_id}"
+        
+        try:
+            r = session.get(
+                url,
+                params={"external_db": "Uniprot/SWISSPROT"},
+                timeout=30
+            )
+
+            if r.status_code == 200:
+                xrefs = r.json()
+                results[gene_id] = [
+                    x["primary_id"] for x in xrefs
+                    if "primary_id" in x
+                ]
+            else:
+                results[gene_id] = []
+
+        except requests.RequestException:
+            results[gene_id] = []
+
+        # small delay to avoid hammering the API
+        time.sleep(0.05)
+
+        if i % 100 == 0:
+            print(f"{i}/{len(ensembl_genes)} completed")
+
+    return results
+
+def add_uniprot_ids_hg37(final_df):
+    ensembl_genes = final_df["Gene"].dropna().unique()
+
+    print(len(ensembl_genes))
+    print(ensembl_genes[:10])
+
+    uniprot_map_hg37 = get_uniprot_ids_hg38(final_df)
+
+    final_df["UniProt_ID"] = final_df["Gene"].map(uniprot_map_hg37)
+
+    return final_df
+
+
+uniprot_map_entrezid_filtered_hg37 = add_uniprot_ids_hg37(mutpred2_entrezid_filtered_hg37)
+uniprot_map_entrezid_filtered_hg37.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg37.tsv"), sep="\t", index=False)
+#clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg37 = add_uniprot_ids_hg37(mutpred2_prot_seq_filtered_hg37)
+
+
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg37 = add_uniprot_ids_hg37(mutpred2_prot_seq_filtered_hg37)
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg37.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg37.tsv"), sep="\t", index=False)
+
+
+
+'''
+
+linvar_w_rest_unipro_mutpred2_entrezid_filtered_hg38 = add_uniprot_ids_hg38(mutpred2_entrezid_filtered_hg38)
+clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg38.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg38.tsv"), sep="\t", index=False)
+
+clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg37= add_uniprot_ids_hg37(mutpred2_entrezid_filtered_hg37)
+clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg37.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg37.tsv"), sep="\t", index=False)
+
+
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg38 = add_uniprot_ids_hg38(mutpred2_prot_seq_filtered_hg38)
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg38.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg38.tsv"), sep="\t", index=False)
+
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg37= add_uniprot_ids_hg37(mutpred2_prot_seq_filtered_hg37)
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg37.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg37.tsv"), sep="\t", index=False)
+
+'''
 #METHOD2:
 
 
 #1. get uniprot ID from ensemble rest
 
-def get_uniprot_id_hg38(gene_id):
-    url = f"https://rest.ensembl.org/xrefs/id/{gene_id}"
 
-    r = requests.get(
-        url,
-        params={"external_db": "Uniprot/SWISSPROT"},
-        headers={"Content-Type": "application/json"}
-    )
+clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg38 = add_uniprot_ids_hg38(mutpred2_entrezid_filtered_hg38)
+clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg38.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg38.tsv"), sep="\t", index=False)
 
-    if r.status_code != 200:
-        return None
-
-    results = r.json()
-    if len(results) == 0:
-        return None
-
-    return results[0]["primary_id"]
+clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg37= add_uniprot_ids_hg37(mutpred2_entrezid_filtered_hg37)
+clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg37.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg37.tsv"), sep="\t", index=False)
 
 
-def add_uniprot_ids_hg38(final_df):
-    ensembl_gene = final_df["Gene"].dropna().unique()
-    print(len(ensembl_gene))
-    print(ensembl_gene[:10])
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg38 = add_uniprot_ids_hg38(mutpred2_prot_seq_filtered_hg38)
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg38.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg38.tsv"), sep="\t", index=False)
 
-    uniprot_map_hg38 = {}
-    for gene1 in ensembl_gene:
-        uniprot_map_hg38[gene1] = get_uniprot_id_hg38(gene1)
-        time.sleep(0.1)
-
-    final_df["Ensembl_UniProt_ID"] = final_df["Gene"].map(uniprot_map_hg38)
-    return final_df
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg37= add_uniprot_ids_hg37(mutpred2_prot_seq_filtered_hg37)
+clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg37.to_csv(os.path.join(mount_results, "clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg37.tsv"), sep="\t", index=False)
 
 
-def get_uniprot_id_hg37(gene_id):
-    url = f"https://grch37.rest.ensembl.org/xrefs/id/{gene_id}"
-
-    r = requests.get(
-        url,
-        params={"external_db": "Uniprot/SWISSPROT"},
-        headers={"Content-Type": "application/json"}
-    )
-
-    if r.status_code != 200:
-        return None
-
-    results = r.json()
-    if len(results) == 0:
-        return None
-
-    return results[0]["primary_id"]
-
-
-def add_uniprot_ids_hg37(final_df):
-    ensembl_gene = final_df["Gene"].dropna().unique()
-    print(len(ensembl_gene))
-    print(ensembl_gene[:10])
-
-    uniprot_map_hg37 = {}
-    for gene1 in ensembl_gene:
-        uniprot_map_hg37[gene1] = get_uniprot_id_hg37(gene1)
-        time.sleep(0.1)
-
-    final_df["Ensembl_UniProt_ID"] = final_df["Gene"].map(uniprot_map_hg37)
-    return final_df
 
 
 #2. merge and remove overlap
 
-def remove_polyphen_variants(final_df, polyphen_train):
 
-    # Split Amino_acids column ("S/N") into WT/Mut
-    aa_split = final_df['Amino_acids'].str.split('/', expand=True)
-    final_df['WT_AA'] = aa_split[0]
-    final_df['Mut_AA'] = aa_split[1]
+def filter_clinvar_by_uniprot_training(
+    clinvar_df,
+    training_df,
+    clinvar_uniprot_col="SWISSPROT_y",
+    gene_col="SYMBOL",
+    uploaded_variation_col="Uploaded_variation"
+):
+    """
+    Filter a ClinVar dataframe using a UniProt-based MutPred2
+    training dataframe.
 
-    # Build matching key on ClinVar side using Ensembl-derived UniProt ID
-    final_df['match_key'] = (
-        final_df['Ensembl_UniProt_ID'].astype(str) + "_" +
-        final_df['Protein_position'].astype(str) + "_" +
-        final_df['WT_AA'].astype(str) + "_" +
-        final_df['Mut_AA'].astype(str)
+    Matching key:
+        normalized UniProt ID + position + ref_aa + alt_aa
+
+    Example ClinVar:
+        SWISSPROT_y      = P05161.238
+        Protein_position = 141
+        Amino_acids      = G/S
+
+    Example training:
+        uniprot_id = P05161
+        position   = 141
+        ref_aa     = G
+        alt_aa     = S
+
+    These are considered a match.
+
+    Returns
+    -------
+    clinvar_filtered : pd.DataFrame
+        Filtered ClinVar dataframe.
+
+    summary : pd.DataFrame
+        Before/after/removed counts.
+
+    removed_variants : pd.DataFrame
+        ClinVar rows removed because they matched the training set.
+    """
+
+    clinvar = clinvar_df.copy()
+    training = training_df.copy()
+
+    # =========================================================
+    # 1. Normalize UniProt IDs
+    # =========================================================
+
+    clinvar["_uniprot_id"] = (
+        clinvar[clinvar_uniprot_col]
+        .astype("string")
+        .str.strip()
+        .str.split(".")
+        .str[0]
     )
 
-    # Build matching key on PolyPhen training side
-    polyphen_train['match_key'] = (
-        polyphen_train['uniprot_id'].astype(str) + "_" +
-        polyphen_train['position'].astype(str) + "_" +
-        polyphen_train['ref_aa'].astype(str) + "_" +
-        polyphen_train['alt_aa'].astype(str)
+    training["_uniprot_id"] = (
+        training["uniprot_id"]
+        .astype("string")
+        .str.strip()
+        .str.split(".")
+        .str[0]
     )
 
-    polyphen_keys = set(polyphen_train['match_key'])
+    # =========================================================
+    # 2. Normalize protein positions
+    # =========================================================
 
-    print(f"gene count Before filtering: {final_df['Gene'].nunique()}")
-    print(f"variant count Before filtering: {final_df['Uploaded_variation'].nunique()}")
+    clinvar["_position"] = pd.to_numeric(
+        clinvar["Protein_position"],
+        errors="coerce"
+    ).astype("Int64")
 
-    final_df_filtered = final_df[~final_df['match_key'].isin(polyphen_keys)].copy()
+    training["_position"] = pd.to_numeric(
+        training["position"],
+        errors="coerce"
+    ).astype("Int64")
 
-    print(f"gene count After filtering: {final_df_filtered['Gene'].nunique()}")
-    print(f"variant count After filtering: {final_df_filtered['Uploaded_variation'].nunique()}")
-    print(f"genes Removed: {final_df['Gene'].nunique() - final_df_filtered['Gene'].nunique()}")
-    print(f"variants Removed: {final_df['Uploaded_variation'].nunique() - final_df_filtered['Uploaded_variation'].nunique()}")
+    # =========================================================
+    # 3. Parse reference / alternate amino acids from ClinVar
+    # =========================================================
 
-    final_df_filtered = final_df_filtered.drop(columns=['match_key', 'WT_AA', 'Mut_AA'])
+    aa = (
+        clinvar["Amino_acids"]
+        .astype("string")
+        .str.split("/", n=1, expand=True)
+    )
 
-    return final_df_filtered
+    clinvar["_ref_aa"] = aa[0].str.strip()
+    clinvar["_alt_aa"] = aa[1].str.strip()
 
+    # =========================================================
+    # 4. Normalize training amino acids
+    # =========================================================
 
+    training["_ref_aa"] = (
+        training["ref_aa"]
+        .astype("string")
+        .str.strip()
+    )
 
-final_df_filtered_hg38 = remove_polyphen_variants(input_hg38, poly_phen_training_set)
-final_df_filtered_hg38.to_csv(
-    os.path.join(mount_results, "clinvar_filtered_for_polyphen_hg38_method2.tsv"),
-    sep="\t", index=False
+    training["_alt_aa"] = (
+        training["alt_aa"]
+        .astype("string")
+        .str.strip()
+    )
+
+    # =========================================================
+    # 5. Create explicit matching key
+    #
+    # Example:
+    # P05161:G141S
+    # =========================================================
+
+    clinvar["uniprot_variant_key"] = (
+        clinvar["_uniprot_id"]
+        + ":"
+        + clinvar["_ref_aa"]
+        + clinvar["_position"].astype("string")
+        + clinvar["_alt_aa"]
+    )
+
+    training["uniprot_variant_key"] = (
+        training["_uniprot_id"]
+        + ":"
+        + training["_ref_aa"]
+        + training["_position"].astype("string")
+        + training["_alt_aa"]
+    )
+
+    # =========================================================
+    # 6. Starting counts
+    # =========================================================
+
+    before_rows = len(clinvar)
+
+    before_genes = clinvar[
+        gene_col
+    ].nunique(dropna=True)
+
+    before_variants = clinvar[
+        uploaded_variation_col
+    ].nunique(dropna=True)
+
+    # =========================================================
+    # 7. Training-set keys
+    # =========================================================
+
+    training_keys = (
+        training[
+            ["uniprot_variant_key"]
+        ]
+        .dropna()
+        .drop_duplicates()
+        .assign(_training_match=True)
+    )
+
+    # =========================================================
+    # 8. Match ClinVar to training set
+    # =========================================================
+
+    clinvar = clinvar.merge(
+        training_keys,
+        on="uniprot_variant_key",
+        how="left"
+    )
+
+    # =========================================================
+    # 9. Identify variants being removed
+    # =========================================================
+
+    removed_variants = clinvar[
+        clinvar["_training_match"].eq(True)
+    ].copy()
+
+    # =========================================================
+    # 10. Filter
+    # =========================================================
+
+    clinvar_filtered = clinvar[
+        clinvar["_training_match"].isna()
+    ].copy()
+
+    # =========================================================
+    # 11. Ending counts
+    # =========================================================
+
+    after_rows = len(clinvar_filtered)
+
+    after_genes = clinvar_filtered[
+        gene_col
+    ].nunique(dropna=True)
+
+    after_variants = clinvar_filtered[
+        uploaded_variation_col
+    ].nunique(dropna=True)
+
+    # =========================================================
+    # 12. Summary
+    # =========================================================
+
+    summary = pd.DataFrame({
+        "metric": [
+            "Rows",
+            "Unique genes",
+            "Unique Uploaded_variation"
+        ],
+        "before_filter": [
+            before_rows,
+            before_genes,
+            before_variants
+        ],
+        "after_filter": [
+            after_rows,
+            after_genes,
+            after_variants
+        ],
+        "removed": [
+            before_rows - after_rows,
+            before_genes - after_genes,
+            before_variants - after_variants
+        ]
+    })
+
+    # =========================================================
+    # 13. Remove temporary columns
+    # =========================================================
+
+    helper_cols = [
+        "_uniprot_id",
+        "_position",
+        "_ref_aa",
+        "_alt_aa",
+        "_training_match"
+    ]
+
+    clinvar_filtered = clinvar_filtered.drop(
+        columns=helper_cols,
+        errors="ignore"
+    )
+
+    removed_variants = removed_variants.drop(
+        columns=helper_cols,
+        errors="ignore"
+    )
+
+    return (
+        clinvar_filtered,
+        summary,
+        removed_variants
+    )
+
+(
+    clinvar_rest_uniprot_filtered_w_mutpred2_entrezid_filtered_hg38,
+    uniprot_rest_summary_w_mutpred2_entrezid_filtered_hg38,
+    uniprot_rest_removed_w_mutpred2_entrezid_filtered_hg38
+) = filter_clinvar_by_uniprot_training(
+    clinvar_df=clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg38,
+    training_df=poly_phen_training_set,
+    clinvar_uniprot_col="Ensembl_UniProt_ID"
 )
 
-final_df_filtered_hg37 = remove_polyphen_variants(input_hg37, poly_phen_training_set)
-final_df_filtered_hg37.to_csv(
-    os.path.join(mount_results, "clinvar_filtered_for_polyphen_hg37_method2.tsv"),
-    sep="\t", index=False
+print(uniprot_rest_summary_w_mutpred2_entrezid_filtered_hg38)
+
+
+(
+    clinvar_rest_uniprot_filtered_w_mutpred2_entrezid_filtered_hg37,
+    uniprot_rest_summary_w_mutpred2_entrezid_filtered_hg37,
+    uniprot_rest_removed_w_mutpred2_entrezid_filtered_hg37
+) = filter_clinvar_by_uniprot_training(
+    clinvar_df=clinvar_w_rest_unipro_mutpred2_entrezid_filtered_hg37,
+    training_df=poly_phen_training_set,
+    clinvar_uniprot_col="Ensembl_UniProt_ID"
 )
 
+print(uniprot_rest_summary_w_mutpred2_entrezid_filtered_hg37)
+
+
+
+
+
+
+
+(
+    clinvar_rest_uniprot_filtered_w_mutpred2_prot_seq_filtered_hg38,
+    uniprot_rest_summary_w_mutpred2_prot_seq_filtered_hg38,
+    uniprot_rest_removed_w_mutpred2_prot_seq_filtered_hg38
+) = filter_clinvar_by_uniprot_training(
+    clinvar_df=clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg38,
+    training_df=poly_phen_training_set,
+    clinvar_uniprot_col="Ensembl_UniProt_ID"
+)
+
+print(uniprot_rest_summary_w_mutpred2_prot_seq_filtered_hg38)
+
+
+(
+    clinvar_rest_uniprot_filtered_w_mutpred2_prot_seq_filtered_hg37,
+    uniprot_rest_summary_w_mutpred2_prot_seq_filtered_hg37,
+    uniprot_rest_removed_w_mutpred2_prot_seq_filtered_hg37
+) = filter_clinvar_by_uniprot_training(
+    clinvar_df=clinvar_w_rest_unipro_mutpred2_prot_seq_filtered_hg37,
+    training_df=poly_phen_training_set,
+    clinvar_uniprot_col="Ensembl_UniProt_ID"
+)
+
+print(uniprot_rest_summary_w_mutpred2_prot_seq_filtered_hg37)
 
 
 
@@ -299,98 +878,219 @@ final_df_filtered_hg37.to_csv(
 
 
 
+##concordanance and plotting
+#can only compare using hg38 to hg38
 
 
+def compare_uniprot_filter_concordance(
+    original_df,
+    vep_uniprot_filtered_df,
+    ensembl_rest_uniprot_filtered_df,
+    uploaded_variation_col="Uploaded_variation",
+    gene_col="SYMBOL"
+):
+    """
+    Compare concordance between two UniProt-based filters:
 
-'''
+        1. UniProt IDs obtained from VEP
+        2. UniProt IDs obtained from Ensembl REST
 
+    The comparison is performed on Uploaded_variation.
 
-def get_uniprot_id_hg38(ensembl_id):
-  url = f"https://rest.ensembl.org/xrefs/id/{ensembl_id}"
+    Parameters
+    ----------
+    original_df : pd.DataFrame
+        The dataframe BEFORE either UniProt-based filter.
 
-  r = requests.get(
-      url,
-      params={
-          "external_db": "UniProtKB/Swiss-Prot"
-      },  # Use "UniProtKB/Swiss-Prot" for reviewed proteins (recommended)
-      headers={"Content-Type": "application/json"},
-  )
+    vep_uniprot_filtered_df : pd.DataFrame
+        Dataframe after filtering using UniProt IDs from VEP.
 
-  if r.status_code != 200:
-    return None
+    ensembl_rest_uniprot_filtered_df : pd.DataFrame
+        Dataframe after filtering using UniProt IDs from Ensembl REST.
 
-  results = r.json()
+    uploaded_variation_col : str
+        Column identifying the variant.
 
-  if not results or len(results) == 0:
-    return None
+    gene_col : str
+        Gene column.
 
-  return results[0]["primary_id"]
+    Returns
+    -------
+    summary : pd.DataFrame
+        Concordance summary.
 
+    removed_by_vep : pd.DataFrame
+        Variants removed only by the VEP-UniProt filter.
 
-def get_uniprot_id_hg37(ensembl_gene):
-  url = f"https://grch37.rest.ensembl.org/xrefs/id/{ensembl_gene}"
+    removed_by_rest : pd.DataFrame
+        Variants removed only by the Ensembl-REST-UniProt filter.
 
-  r = requests.get(
-      url,
-      params={"external_db": "UniProtKB/Swiss-Prot"},
-      headers={"Content-Type": "application/json"},
-  )
+    removed_by_both : pd.DataFrame
+        Variants removed by both filters.
+    """
 
-  if r.status_code != 200:
-    return None
+    # ---------------------------------------------------------
+    # Create sets of Uploaded_variation
+    # ---------------------------------------------------------
 
-  results = r.json()
+    original_variants = set(
+        original_df[uploaded_variation_col]
+        .dropna()
+    )
 
-  if not results:
-    return None
+    vep_remaining = set(
+        vep_uniprot_filtered_df[uploaded_variation_col]
+        .dropna()
+    )
 
-  return results[0]["primary_id"]
+    rest_remaining = set(
+        ensembl_rest_uniprot_filtered_df[uploaded_variation_col]
+        .dropna()
+    )
 
+    # ---------------------------------------------------------
+    # Variants removed by each filter
+    # ---------------------------------------------------------
 
+    vep_removed = (
+        original_variants - vep_remaining
+    )
 
+    rest_removed = (
+        original_variants - rest_remaining
+    )
 
-#usage:
- 
-poly_phen_training_set = load_poly_phen_data()
+    # ---------------------------------------------------------
+    # Concordance categories
+    # ---------------------------------------------------------
 
-ensembl_genes_hg38 = get_ensembl_gene(final_hg37)
-ensembl_genes_hg37 = get_ensembl_gene(final_hg38)
+    removed_by_both_set = (
+        vep_removed & rest_removed
+    )
 
+    vep_only_set = (
+        vep_removed - rest_removed
+    )
 
-uniprot_map_hg38 = {}
-for gene1 in ensembl_genes_hg38:
-    uniprot_map_hg38[gene1] = uniprot_map_hg38[gene1]
+    rest_only_set = (
+        rest_removed - vep_removed
+    )
+
+    union_removed_set = (
+        vep_removed | rest_removed
+    )
+
+    # ---------------------------------------------------------
+    # Concordance calculations
+    # ---------------------------------------------------------
+
+    jaccard = (
+        len(removed_by_both_set) /
+        len(union_removed_set)
+        if union_removed_set
+        else 1.0
+    )
+
+    vep_shared = (
+        len(removed_by_both_set) /
+        len(vep_removed) * 100
+        if vep_removed
+        else 0
+    )
+
+    rest_shared = (
+        len(removed_by_both_set) /
+        len(rest_removed) * 100
+        if rest_removed
+        else 0
+    )
+
+    # ---------------------------------------------------------
+    # Summary
+    # ---------------------------------------------------------
+
+    summary = pd.DataFrame({
+        "metric": [
+            "Original Uploaded_variation",
+            "Removed by VEP UniProt",
+            "Removed by Ensembl REST UniProt",
+            "Removed by both",
+            "Removed only by VEP UniProt",
+            "Removed only by Ensembl REST UniProt",
+            "Union of variants removed",
+            "Jaccard concordance (%)",
+            "VEP UniProt removals shared with Ensembl REST (%)",
+            "Ensembl REST UniProt removals shared with VEP (%)"
+        ],
+        "count": [
+            len(original_variants),
+            len(vep_removed),
+            len(rest_removed),
+            len(removed_by_both_set),
+            len(vep_only_set),
+            len(rest_only_set),
+            len(union_removed_set),
+            jaccard * 100,
+            vep_shared,
+            rest_shared
+        ]
+    })
+
+    # ---------------------------------------------------------
+    # Return actual variant rows for each category
+    # ---------------------------------------------------------
+
+    removed_by_vep = original_df[
+        original_df[uploaded_variation_col].isin(
+            vep_only_set
+        )
+    ].copy()
+
+    removed_by_rest = original_df[
+        original_df[uploaded_variation_col].isin(
+            rest_only_set
+        )
+    ].copy()
+
+    removed_by_both = original_df[
+        original_df[uploaded_variation_col].isin(
+            removed_by_both_set
+        )
+    ].copy()
+
+    return (
+        summary,
+        removed_by_vep,
+        removed_by_rest,
+        removed_by_both
+    )
     
-final_hg38["Uniprot_ID"] = final_hg38["Gene"].map(uniprot_map_hg38)
+    
+
+(
+    uniprot_concordance_summary_w_mutpred2_prot_seq_filtered_hg38,
+    uniprot_vep_only_w_mutpred2_prot_seq_filtered_hg38,
+    uniprot_rest_only_w_mutpred2_prot_seq_filtered_hg38,
+    uniprot_both_w_mutpred2_prot_seq_filtered_hg38
+) = compare_uniprot_filter_concordance(
+    original_df=mutpred2_prot_seq_filtered_hg38,
+    vep_uniprot_filtered_df=clinvar_uniprot_filtered_w_mutpred2_prot_seq_filtered_hg38,
+    ensembl_rest_uniprot_filtered_df=clinvar_rest_uniprot_filtered_w_mutpred2_prot_seq_filtered_hg38
+)
+
+print(uniprot_concordance_summary_w_mutpred2_prot_seq_filtered_hg38)
 
 
 
+(
+    uniprot_concordance_summary_w_mutpred2_entrezid_filtered_hg38,
+    uniprot_vep_only_w_mutpred2_entrezid_filtered_hg38,
+    uniprot_rest_only_w_mutpred2_entrezid_filtered_hg38,
+    uniprot_both_w_mutpred2_entrezid_filtered_hg38
+) = compare_uniprot_filter_concordance(
+    original_df=mutpred2_entrezid_filtered_hg38,
+    vep_uniprot_filtered_df=clinvar_uniprot_filtered_w_mutpred2_entrezid_filtered_hg38,
+    ensembl_rest_uniprot_filtered_df=clinvar_rest_uniprot_filtered_w_mutpred2_entrezid_filtered_hg38
+)
 
-uniprot_map_hg37 = {}
-for gene2 in ensembl_genes_hg37:
-    uniprot_map_hg37[gene2] = uniprot_map_hg37[gene2]
-
-final_hg37["Entrez_ID"] = final_hg37["Gene"].map(uniprot_map_hg37)
-
-#save output
-
-final_hg38.to_csv(
-        os.path.join(mount_results, "clinvar_polyphen_hg38.tsv"),
-        sep="\t",
-        index=False
-    )
-
-final_hg37.to_csv(
-        os.path.join(mount_results, "clinvar_removed_polyphen_hg37.tsv"),
-        sep="\t",
-        index=False
-    )
-
-
-
-#REmove polyphen2 training variants also
-
-
-
-
-'''
+print(uniprot_concordance_summary_w_mutpred2_entrezid_filtered_hg38)
