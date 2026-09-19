@@ -51,8 +51,41 @@ get_polyphen2_training_data () {
 
 }
 
+
+
+get_db () {
+
+    cd $data || exit 1. #do this command or exit if it fails
+
+    
+}
+
+
+get_final_mmmc2_final_df_for_concordance () {
+
+    cd $data || exit 1. #do this command or exit if it fails
+
+    cp  /Users/jwillis/Downloads/mmc2-3.xlsx    /Users/jwillis/minerva/pejaverlab/data/2026-09-03_calibration_training_dataset
+}
+
+get_uniprotID_and_prot_seq_from_ensembl_ftp () {
+
+     cd $data || exit 1. #do this command or exit if it fails
+
+     wget -c https://ftp.ensembl.org/pub/current/fasta/homo_sapiens/pep/Homo_sapiens.GRCh38.pep.all.fa.gz
+	
+     wget -c https://ftp.ensembl.org/pub/current/tsv/homo_sapiens/Homo_sapiens.GRCh38.116.uniprot.tsv.gz
+
+     wget -c https://ftp.ensembl.org/pub/grch37/current/fasta/homo_sapiens/pep/Homo_sapiens.GRCh37.pep.all.fa.gz
+
+     wget -c https://ftp.ensembl.org/pub/grch37/current/tsv/homo_sapiens/Homo_sapiens.GRCh37.85.uniprot.tsv.gz
+}
+
+
 #fucnction calls 
 
 #get_mp2_training_data
 #get_clinvar_test_data
-get_polyphen2_training_data 
+#get_polyphen2_training_data
+get_uniprotID_and_prot_seq_from_ensembl_ftp
+ 

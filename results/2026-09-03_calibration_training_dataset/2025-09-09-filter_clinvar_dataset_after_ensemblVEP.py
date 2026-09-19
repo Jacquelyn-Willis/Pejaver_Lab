@@ -6,7 +6,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import requests
 import tarfile
+import os
+import pandas as pd
+from Bio import SeqIO
+import gzip
+
 #!{sys.executable} -m pip install requests
+#!{sys.executable} -m pip install Bio
 
 #directories 
 mount_data = "/Users/jwillis/minerva/pejaverlab/data/2026-09-03_calibration_training_dataset"
@@ -176,235 +182,6 @@ final_hg37.to_csv(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-'''
-step_dataframes = {
-
-            "vep_out_hg38_df": vep_out_hg38_df,
-            "vep_out_hg37_df": vep_out_hg37_df,
-            "MANE_Select_hg38": mane_select_transcripts_hg38,
-            "Canonical_hg37": canonical_transcripts_hg37,
-            "missense_hg38": vep_missense_hg38,
-            "missense_hg37": vep_missense_hg37,
-            "AF_hg38": AF_filtered_hg38,
-            "AF_hg37": AF_filtered_hg37,
-        
-}
-
-df_summary = build_filter_summary_table(step_dataframes)
-
-display(df_summary)
-
-plot_filter_summary(df_summary, metric="UniqueVariationID")
-plot_filter_summary(df_summary, metric="UniqueGeneSymbol")
-'''
-
-
-#remove mutpred2 training variants that overlap 
-
-
-    
-
-#REmove polyphen2 training variants also
-def load_poly_phen_data ():
-    
-     
-    tar_path = os.path.join(
-        mount_data,
-        "training-2.2.2.tar.gz"
-    )
-
-    polyphen_files = [
-        "humdiv-2011_12.deleterious.pph.input",
-        "humdiv-2011_12.neutral.pph.input",
-        "humvar-2011_12.deleterious.pph.input",
-        "humvar-2011_12.neutral.pph.input",
-    ]
-
-    polyphen_dfs = []
-
-    with tarfile.open(tar_path, "r:gz") as tar:
-
-        for filename in polyphen_files:
-
-            member = tar.getmember(filename)
-
-            with tar.extractfile(member) as f:
-
-                df = pd.read_csv(
-                    f,
-                    sep="\t",
-                    header=None,
-                    names=[
-                        "uniprot_id",
-                        "position",
-                        "ref_aa",
-                        "alt_aa"
-                    ]
-                )
-
-                polyphen_dfs.append(df)
-
-    # Combine all four files
-    polyphen_train = pd.concat(
-        polyphen_dfs,
-        ignore_index=True
-    )
-
-    print(polyphen_train.head())
-    print(polyphen_train.shape)
-    
-    return polyphen_train
-
-poly_phen_training_set = load_poly_phen_data()
-
-
-
-
-
-def get_uniprot_ids_batch(transcripts, genome="hg38", batch_size=100):
-    
-    if genome == "hg38":
-        base_url = "https://rest.ensembl.org"
-    elif genome == "hg37":
-        base_url = "https://grch37.rest.ensembl.org"
-    else:
-        raise ValueError("genome must be 'hg38' or 'hg37'")
-
-    url = f"{base_url}/xrefs/id"
-
-    results_map = {}
-
-    for start in range(0, len(transcripts), batch_size):
-        batch = list(transcripts[start:start + batch_size])
-
-        response = requests.post(
-            url,
-            json={
-                "ids": batch
-            },
-            params={
-                "external_db": "UniProtKB/Swiss-Prot"
-            },
-            headers={
-                "Content-Type": "application/json"
-            },
-            timeout=60
-        )
-
-        response.raise_for_status()
-
-        results = response.json()
-
-        for transcript, refs in results.items():
-            if refs:
-                results_map[transcript] = refs[0]["primary_id"]
-            else:
-                results_map[transcript] = None
-
-    return results_map
-
-
-
-
-
-transcripts_hg38 = (
-    mutpred_merge_removal_hg38["Feature"]
-    .dropna()
-    .unique()
-)
-uniprot_map_hg38 = get_uniprot_ids_batch(
-    transcripts_hg38,
-    genome="hg38"
-)
-
-mutpred_merge_removal_hg38["UniProt_ID"] = (
-    mutpred_merge_removal_hg38["Feature"]
-    .map(uniprot_map_hg38)
-)
-
-print(
-    mutpred_merge_removal_hg38["UniProt_ID"].notna().sum(),
-    "of",
-    len(mutpred_merge_removal_hg38),
-    "rows have a UniProt ID"
-)
-
-
-
-
-
-
-
-transcripts_hg37 = (
-    mutpred_merge_removal_hg37["Feature"]
-    .dropna()
-    .unique()
-)
-
-uniprot_map_hg37 = {
-    transcript: get_uniprot_id(
-        transcript,
-        genome="hg37"
-    )
-    for transcript in transcripts_hg37
-}
-
-mutpred_merge_removal_hg37["UniProt_ID"] = (
-    mutpred_merge_removal_hg37["Feature"]
-    .map(uniprot_map_hg37)
-)
-
-
-
-def remove_polyphen_training_variants(vep_df):
-    # 1. Load your VEP dataset and the PolyPhen-2 training file
-
-    train_df = pd.read_csv(os.path.join(mount_data,'training-2.2.2.tar.gz'),
-            sep=r"\s+",
-            header= None,
-            names=["uniprot_id", "position", "ref_aa", "alt_aa"],
-            compression='gzip',
-            low_memory=False
-        )
-    # 2. Ensure gene symbols match (assuming you've mapped training uniprot_ids to gene SYMBOLS)
-    # train_df['SYMBOL'] = train_df['uniprot_id'].map(your_mapping_dict)
-
-    # 3. Perform the anti-join to drop training variants from your dataset
-    merged = vep_df.merge(
-        train_df,
-        left_on=["SYMBOL", "Protein_position", "Ref_AA", "Alt_AA"],
-        right_on=["SYMBOL", "position", "ref_aa", "alt_aa"],
-        how="left",
-        indicator=True,
-    )
-
-    filtered_df = merged[merged["_merge"] == "left_only"].drop(
-        columns=["_merge", "position", "ref_aa", "alt_aa"]
-    )
-    
-    return filtered_df
-    
-
-removed_polyphen_hg38 = remove_polyphen_training_variants(filtered_hg38)
-removed_polyphen_hg37 = remove_polyphen_training_variants(XX)
-
-
 #summarize and plot outputs:
 
 def build_filter_summary_table(step_dataframes):
@@ -453,6 +230,184 @@ def plot_filter_summary(df_summary, metric="UniqueVariationID"):
 
 
 
+#summarize and plot outputs:
+
+def build_filter_summary_table(step_dataframes):
+    rows = []
+
+    for step_label, step_df in step_dataframes.items():
+        
+            rows.append({
+                "FilterStep": step_label,
+                "Assembly": "All",
+                "UniqueGeneSymbol": step_df["Gene"].nunique(),
+                "UniqueVariationID": step_df["Uploaded_variation"].nunique(),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def plot_filter_summary(df_summary, metric="UniqueVariationID"):
+    """
+    Plot a grouped bar chart comparing GRCh37 and GRCh38 counts per filter step
+    with exact numerical values labeled above each bar.
+    """
+    # Reshape data for plotting side-by-side assembly bars per step
+    pivot_df = df_summary.pivot(index="FilterStep", columns="Assembly", values=metric)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    plot_order = pivot_df.index.tolist()
+    pivot_df.reindex(plot_order).plot(kind="bar", ax=ax, width=0.75)
+    
+    ax.set_title(f"Filtering Summary by Assembly ({metric})", fontsize=14, fontweight="bold", pad=15)
+    ax.set_ylabel("Count", fontsize=12)
+    ax.set_xlabel("Filter Step", fontsize=12)
+    plt.xticks(rotation=35, ha="right")
+    
+    # Annotate exact numbers above each bar
+    for container in ax.containers:
+        ax.bar_label(container, fmt="{:,.0f}", padding=3, fontsize=9)
+        
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+
+
+
+
+#get clinvar variants protein seq and uniprot ID
+
+
+##1. LOAD DATA
+def fasta_to_df(fasta_file):
+    records = []
+
+    with gzip.open(fasta_file, "rt") as handle:
+        for record in SeqIO.parse(handle, "fasta"):
+
+            fields = {
+                x.split(":", 1)[0]: x.split(":", 1)[1]
+                for x in record.description.split()
+                if ":" in x
+            }
+
+            records.append({
+                "gene_stable_id": fields["gene"].split(".")[0],
+                "transcript_stable_id": fields["transcript"].split(".")[0],
+                "protein_stable_id": record.id.split(".")[0],
+                "sequence": str(record.seq)
+            })
+
+    return pd.DataFrame(records)
+
+
+
+
+variants_hg38 = pd.read_csv(os.path.join(mount_results, "clinvar_hg38_post_ensemble_vep_filters_no_uniprot.tsv"), sep="\t", header = 0)
+variants_hg37 = pd.read_csv(os.path.join(mount_results, "clinvar_hg37_post_ensemble_vep_filters_no_uniprot.tsv"), sep="\t", header = 0)
+
+
+uniprot_df_hg38 = pd.read_csv(os.path.join(mount_data, "Homo_sapiens.GRCh38.116.uniprot.tsv.gz"),  sep="\t", low_memory=False )
+prot_seq_df_hg38 = fasta_to_df(os.path.join(mount_data, "Homo_sapiens.GRCh38.pep.all.fa.gz"))
+
+
+uniprot_df_hg37 = pd.read_csv(os.path.join(mount_data, "Homo_sapiens.GRCh37.85.uniprot.tsv.gz"),  sep="\t", low_memory=False)
+prot_seq_df_hg37 = fasta_to_df(os.path.join(mount_data, "Homo_sapiens.GRCh37.pep.all.fa.gz"))
+
+
+
+
+##2. MERGE uniprot and fsta protein sequences
+def merge_uniprot_protein_seq(uniprot_df, prot_seq_df):
+    
+    merged_df = uniprot_df.merge(
+        prot_seq_df,
+        on=[
+            "gene_stable_id",
+            "transcript_stable_id",
+            "protein_stable_id"
+        ],
+        how="right"
+    )
+    
+    return merged_df
+
+
+annot_df_hg37 = merge_uniprot_protein_seq(
+    uniprot_df_hg37,
+    prot_seq_df_hg37
+)
+
+annot_df_hg38 = merge_uniprot_protein_seq(
+    uniprot_df_hg38,
+    prot_seq_df_hg38
+)
+
+
+##3. MERGE the annot_df with the clinvar files
+def merge_variants_annotations(variants_df, annot_df):
+
+    # Preserve a unique ID for every original variant row
+    variants_df = variants_df.copy()
+    variants_df["_variant_row"] = range(len(variants_df))
+
+    # Merge annotations
+    merged_df = variants_df.merge(
+        annot_df,
+        left_on=["Gene", "Feature"],
+        right_on=["gene_stable_id", "transcript_stable_id"],
+        how="left"
+    )
+
+    # Original variant rows that received at least one annotation
+    mapped_ids = merged_df.loc[
+        merged_df["protein_stable_id"].notna(),
+        "_variant_row"
+    ].unique()
+
+    n_total = len(variants_df)
+    n_mapped = len(mapped_ids)
+    n_unmapped = n_total - n_mapped
+
+    print(f"Starting variants: {n_total:,}")
+    print(f"Mapped variants:   {n_mapped:,} ({n_mapped/n_total:.2%})")
+    print(f"Unmapped variants: {n_unmapped:,} ({n_unmapped/n_total:.2%})")
+    
+    
+    unmapped = variants_df.loc[
+    ~variants_df.index.isin(
+        merged_df.loc[
+            merged_df["protein_stable_id"].notna(),
+            "_variant_row"
+        ]
+    )
+]
+    print(f"unmapped variants: {unmapped}")
+
+    return merged_df
+
+
+annotated_variants_hg37 = merge_variants_annotations(
+    variants_hg37,
+    annot_df_hg37
+)
+
+annotated_variants_hg37.to_csv(os.path.join(mount_results, "annotated_variants_hg37_for_vep_training_filter.tsv"), sep="\t", index=False)
+
+annotated_variants_hg38 = merge_variants_annotations(
+    variants_hg38,
+    annot_df_hg38
+)
+
+annotated_variants_hg38.to_csv(os.path.join(mount_results, "annotated_variants_hg38_for_vep_training_filter.tsv"), sep="\t", index=False)
+
 
 
 
@@ -476,6 +431,26 @@ def main():
 
     AF_filtered_hg38 = filter_AF_gnomad(vep_missense_hg38)  
     AF_filtered_hg37 = filter_AF_gnomad(vep_missense_hg37)  
+    
+    step_dataframes = {
+
+            "vep_out_hg38_df": vep_out_hg38_df,
+            "vep_out_hg37_df": vep_out_hg37_df,
+            "MANE_Select_hg38": mane_select_transcripts_hg38,
+            "Canonical_hg37": canonical_transcripts_hg37,
+            "missense_hg38": vep_missense_hg38,
+            "missense_hg37": vep_missense_hg37,
+            "AF_hg38": AF_filtered_hg38,
+            "AF_hg37": AF_filtered_hg37}
+
+    df_summary = build_filter_summary_table(step_dataframes)
+
+    display(df_summary)
+
+    plot_filter_summary(df_summary, metric="UniqueVariationID")
+    plot_filter_summary(df_summary, metric="UniqueGeneSymbol")
+
+
     
     # Return a dictionary of the DataFrames you want to inspect
     return {
